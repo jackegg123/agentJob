@@ -4,7 +4,18 @@ Welcome to the agentJob project.
 
 ## Project Description
 
-This is a new project for managing and running agent jobs.
+This is a new project for managing and running agent jobs. The repository will contain multiple small sub-projects and features, each organized in its own directory under the root.
+
+## Sub-Projects
+
+### 🍄 About Mushroom - AI Self Introduction
+
+A simple HTML webpage that introduces 小香菇 (Little Mushroom), the AI assistant built on OpenClaw.
+
+- **Location**: `about-mushroom/`
+- **Tech**: HTML, CSS (vanilla)
+- **Description**: A responsive, animated self-introduction page showcasing the assistant's personality, capabilities, and philosophy.
+- **Live**: [View on GitHub Pages](https://jackegg123.github.io/agentJob/about-mushroom/)
 
 ## Getting Started
 
