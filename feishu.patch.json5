@@ -1,7 +1,0 @@
-{
-  channels: {
-    feishu: {
-      allowFrom: ["ou_1dbe16f4f810c03e1e455808c469077b", "8efad56b"]
-    }
-  }
-}
