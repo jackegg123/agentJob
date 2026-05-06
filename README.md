@@ -17,6 +17,15 @@ A simple HTML webpage that introduces 小香菇 (Little Mushroom), the AI assist
 - **Description**: A responsive, animated self-introduction page showcasing the assistant's personality, capabilities, and philosophy.
 - **Live**: [View on GitHub Pages](https://jackegg123.github.io/agentJob/about-mushroom/)
 
+### ✨ Claude Code Hello World Demo
+
+A demonstration webpage created using Claude Code with Qiniu Cloud's Step model API.
+
+- **Location**: `claude-demo/`
+- **Tech**: HTML, CSS, JavaScript (vanilla)
+- **Description**: A simple "Hello World" page showcasing AI-assisted development with Claude Code. Features a modern gradient design, interactive button, and responsive layout.
+- **Built with**: Claude Code + 七牛云 Step API
+
 ## Getting Started
 
 To get started with this project, clone the repository and follow the setup instructions.
