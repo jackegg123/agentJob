@@ -19,13 +19,13 @@ A simple HTML webpage that introduces 小香菇 (Little Mushroom), the AI assist
 
 ### ✨ Claude Code Hello World Demo
 
-A demonstration webpage created using Claude Code with Qiniu Cloud's Step model API.
+A demonstration webpage created using Claude Code with DeepSeek API.
 
 - **Location**: `claude-demo/`
 - **Tech**: HTML, CSS, JavaScript (vanilla)
 - **Description**: A simple "Hello World" page showcasing AI-assisted development with Claude Code. Features a modern gradient design, interactive button, and responsive layout.
 - **Live**: [View on GitHub Pages](https://jackegg123.github.io/agentJob/claude-demo/)
-- **Built with**: Claude Code + 七牛云 Step API
+- **Built with**: Claude Code + DeepSeek API
 
 ## Getting Started
 
