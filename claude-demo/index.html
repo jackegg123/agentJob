@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Claude Code Hello World</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 16px;
+            padding: 40px;
+            max-width: 600px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            text-align: center;
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 16px;
+            font-size: 2rem;
+        }
+
+        .badge {
+            display: inline-block;
+            background: linear-gradient(135deg, #FF6B6B, #FF8E53);
+            color: white;
+            padding: 6px 16px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            margin-bottom: 24px;
+            font-weight: 500;
+        }
+
+        p {
+            color: #666;
+            line-height: 1.6;
+            margin-bottom: 24px;
+        }
+
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 14px 32px;
+            font-size: 1rem;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-weight: 600;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        #message {
+            margin-top: 24px;
+            padding: 16px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            color: #333;
+            font-weight: 500;
+            opacity: 0;
+            transition: opacity 0.5s ease;
+        }
+
+        #message.show {
+            opacity: 1;
+        }
+
+        .footer {
+            margin-top: 32px;
+            color: #999;
+            font-size: 0.85rem;
+        }
+
+        .footer code {
+            background: #f0f0f0;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <span class="badge">✨ 由 Claude Code 生成</span>
+        <h1>Hello World!</h1>
+        <p>
+            这是一个使用 <strong>Claude Code</strong> (cc) 开发的简单网页示例。
+            <br><br>
+            点击下面的按钮，看看会发生什么神奇的事情！
+        </p>
+        <button class="btn" onclick="showWelcome()">🚀 点击我</button>
+        <div id="message"></div>
+        <div class="footer">
+            开发工具: <code>Claude Code</code> | 模型: 七牛云 Step
+        </div>
+    </div>
+
+    <script>
+        function showWelcome() {
+            const message = document.getElementById('message');
+            const messages = [
+                "🎉 欢迎使用 Claude Code!",
+                "💡 AI 编程助手在此为您服务",
+                "🚀 软件开发从未如此简单",
+                "⭐ Claude Code - 您的智能编程伙伴"
+            ];
+            message.textContent = messages[Math.floor(Math.random() * messages.length)];
+            message.classList.add('show');
+        }
+
+        // 添加键盘快捷键
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' || e.key === ' ') {
+                showWelcome();
+            }
+        });
+    </script>
+</body>
+</html>
