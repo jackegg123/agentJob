@@ -27,6 +27,16 @@ A demonstration webpage created using Claude Code with DeepSeek API.
 - **Live**: [View on GitHub Pages](https://jackegg123.github.io/agentJob/claude-demo/)
 - **Built with**: Claude Code + DeepSeek API
 
+### 🎮 Tetris - 俄罗斯方块
+
+A fully-featured Tetris game built as a single HTML file.
+
+- **Location**: `tetris-game/`
+- **Tech**: HTML, CSS, JavaScript (vanilla, single-file)
+- **Description**: Classic Tetris with 7-bag randomizer, SRS wall kicks, ghost piece, hold piece, score tracking, level progression, and increasing speed. Supports both keyboard and touch controls. Mobile-friendly with responsive layout.
+- **Live**: [Play Tetris](https://jackegg123.github.io/agentJob/tetris-game/)
+- **Controls**: ← → Move · ↑ Rotate · ↓ Soft Drop · Space Hard Drop · C Hold · P Pause
+
 ## Getting Started
 
 To get started with this project, clone the repository and follow the setup instructions.
