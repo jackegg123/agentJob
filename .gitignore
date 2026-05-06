@@ -11,6 +11,12 @@ memory/
 feishu.patch.json5
 claude-settings-*.json
 
+# 环境变量和密钥
+.env
+.env.local
+*.key
+secrets/
+
 # IDE
 .vscode/
 .idea/
