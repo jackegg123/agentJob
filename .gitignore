@@ -29,3 +29,8 @@ Thumbs.db
 # 临时文件
 *.swp
 *~
+
+# 敏感配置文档 - 可能包含API密钥
+CLAUDE_DEEPSEEK_SETUP.md
+SETUP.md
+README_SETUP.md
