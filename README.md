@@ -37,6 +37,15 @@ A fully-featured Tetris game built as a single HTML file.
 - **Live**: [Play Tetris](https://jackegg123.github.io/agentJob/tetris-game/)
 - **Controls**: ← → Move · ↑ Rotate · ↓ Soft Drop · Space Hard Drop · C Hold · P Pause
 
+### 🎯 vibeSkill - OpenClaw Skills
+
+A collection of custom skills developed through **Vibe Coding** methodology.
+
+- **Location**: `vibeSkill/`
+- **Description**: Skills for OpenClaw agents, built collaboratively with OpenClaw + Claude Code (DeepSeek API).
+- **Development approach**: Vibe Coding — iterative, conversational development where AI assists in writing, testing, and refining code.
+- Each skill is structured as a standalone directory with its own SKILL.md and implementation files.
+
 ## Getting Started
 
 To get started with this project, clone the repository and follow the setup instructions.
