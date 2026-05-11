@@ -74,19 +74,36 @@ npm install -g jscpd
 
 ### #Run
 
-Execute the scanner against a Java project:
+Execute the scanner against a Java project.
+
+**Linux / macOS:**
 
 ```bash
 # Basic usage
-python scripts/main.py --project-path /path/to/java/project
+python3 scripts/main.py --project-path /path/to/java/project
 
 # Specify output path
-python scripts/main.py --project-path /path --output ./report.xlsx
+python3 scripts/main.py --project-path /path --output ./report.xlsx
 
 # Skip one of the scans
-SKIP_JSCPD=1 python scripts/main.py --project-path /path
-SKIP_QODANA=1 python scripts/main.py --project-path /path
+SKIP_JSCPD=1 python3 scripts/main.py --project-path /path
+SKIP_QODANA=1 python3 scripts/main.py --project-path /path
 ```
+
+**Windows (cmd):**
+
+```cmd
+# Basic usage
+python scripts\main.py --project-path C:\path\to\java\project
+
+# Specify output path
+python scripts\main.py --project-path C:\path --output .\report.xlsx
+
+# Skip one of the scans (PowerShell: $env:SKIP_JSCPD=1)
+set SKIP_JSCPD=1 && python scripts\main.py --project-path C:\path
+```
+
+> The scanner will auto-detect missing dependencies and skip the relevant module.
 
 ## Structure
 

@@ -13,6 +13,10 @@ Java Code Scanner Skill - 核心业务逻辑
 环境变量控制:
   SKIP_JSCPD=1  跳过冗余代码扫描
   SKIP_QODANA=1  跳过无用代码扫描
+
+兼容性:
+  - Windows / Linux / macOS 全平台支持
+  - 使用纯 ASCII 符号避免终端乱码
 """
 
 import argparse
@@ -33,6 +37,15 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 # ====================================================================
 # 常量定义
 # ====================================================================
+
+# ASCII 输出符号（兼容所有终端）
+SYM_INFO = "[INFO]"
+SYM_OK = "[OK]"
+SYM_WARN = "[WARN]"
+SYM_ERR = "[ERROR]"
+SYM_SKIP = "[SKIP]"
+SYM_STEP = "[>]"
+SYM_DONE = "[DONE]"
 
 # Sheet 1 表头：冗余重复代码
 HEADER_DUPLICATE = [
@@ -125,26 +138,108 @@ def run_cmd(cmd: List[str], cwd: Optional[str] = None, timeout: int = 1800) -> s
     Returns:
         subprocess.CompletedProcess 对象。
     """
-    print(f"  ▶ {' '.join(cmd)}")
+    print(f"  {SYM_STEP} {' '.join(cmd)}")
     try:
         result = subprocess.run(
             cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout,
         )
         if result.returncode != 0:
-            print(f"  ⚠️  退出码 {result.returncode}")
+            print(f"  {SYM_WARN} 退出码 {result.returncode}")
             if result.stderr:
                 stderr_preview = result.stderr.strip()[:500]
-                print(f"  └─ stderr: {stderr_preview}")
+                print(f"      stderr: {stderr_preview}")
         return result
     except subprocess.TimeoutExpired:
-        print(f"  ❌ 命令超时 ({timeout}s): {' '.join(cmd)}")
+        print(f"  {SYM_ERR} 命令超时 ({timeout}s): {' '.join(cmd)}")
         raise
     except FileNotFoundError:
-        print(f"  ❌ 命令未找到，请确认已安装: {cmd[0]}")
+        print(f"  {SYM_ERR} 命令未找到，请确认已安装: {cmd[0]}")
         raise
     except Exception as e:
-        print(f"  ❌ 执行失败: {e}")
+        print(f"  {SYM_ERR} 执行失败: {e}")
         raise
+
+
+# ====================================================================
+# 模块 1：环境检查
+# ====================================================================
+
+def check_environment() -> Dict[str, bool]:
+    """
+    检查所有运行依赖是否就绪。
+
+    检查项: Python, Node.js, jscpd, qodana CLI
+
+    Returns:
+        字典，key 为依赖名称，value 为是否可用。
+    """
+    print("\n" + "=" * 60)
+    print("  [环境检查] 确认运行依赖")
+    print("=" * 60)
+
+    checks: Dict[str, bool] = {}
+
+    # 1. Python 本身（肯定可用，已经在跑了）
+    py_version = sys.version.split()[0]
+    print(f"  {SYM_OK} Python {py_version}")
+    checks["python"] = True
+
+    # 2. Node.js
+    node_ok = shutil.which("node") is not None
+    if node_ok:
+        try:
+            ver = subprocess.run(["node", "--version"], capture_output=True, text=True, timeout=10)
+            print(f"  {SYM_OK} Node.js {ver.stdout.strip()}")
+        except Exception:
+            print(f"  {SYM_OK} Node.js 已安装")
+    else:
+        print(f"  {SYM_WARN} Node.js 未安装 - jscpd 需要 Node.js >= 16")
+        print("      Windows: https://nodejs.org/ 下载安装")
+        print("      Linux: curl -fsSL https://deb.nodesource.com/setup_18.x | sudo bash - && sudo apt install -y nodejs")
+        print("      macOS: brew install node")
+    checks["node"] = node_ok
+
+    # 3. jscpd
+    jscpd_ok = shutil.which("jscpd") is not None
+    if jscpd_ok:
+        try:
+            ver = subprocess.run(["jscpd", "--version"], capture_output=True, text=True, timeout=10)
+            print(f"  {SYM_OK} jscpd {ver.stdout.strip()}")
+        except Exception:
+            print(f"  {SYM_OK} jscpd 已安装")
+    elif shutil.which("npx") is not None:
+        # jscpd 可能通过 npx 使用
+        print(f"  {SYM_OK} jscpd 将通过 npx 调用")
+        jscpd_ok = True
+    else:
+        print(f"  {SYM_WARN} jscpd 未安装 - 冗余代码扫描将跳过")
+        print("      npm install -g jscpd")
+    checks["jscpd"] = jscpd_ok
+
+    # 4. Qodana CLI
+    qodana_ok = shutil.which("qodana") is not None
+    if qodana_ok:
+        try:
+            ver = subprocess.run(["qodana", "--version"], capture_output=True, text=True, timeout=10)
+            print(f"  {SYM_OK} Qodana {ver.stdout.strip()}")
+        except Exception:
+            print(f"  {SYM_OK} Qodana CLI 已安装")
+    else:
+        print(f"  {SYM_WARN} Qodana CLI 未安装 - 无用代码扫描将跳过")
+        print("      Windows: 从 https://github.com/JetBrains/qodana-cli/releases 下载")
+        print("      Linux/macOS: curl -fsSL https://jb.gg/qodana-cli/install | bash")
+    checks["qodana"] = qodana_ok
+
+    # 汇总
+    all_ready = all(checks.values())
+    if all_ready:
+        print(f"\n  {SYM_OK} 所有依赖就绪")
+    else:
+        missing = [k for k, v in checks.items() if not v]
+        print(f"\n  {SYM_WARN} 部分依赖缺失: {', '.join(missing)}")
+        print("     缺失的模块将被跳过，不影响其他模块运行。")
+
+    return checks
 
 
 # ====================================================================
@@ -163,14 +258,14 @@ def scan_duplicate(project_root: Path, temp_dir: str) -> List[Dict[str, Any]]:
         扫描结果列表，每个字典包含：
             relative_path / filename / start_line / end_line / issue_type / description。
     """
-    print("\n═══════════════════════════════════════════════")
-    print("  [模块 1/2] 冗余重复代码扫描 — jscpd")
-    print("═══════════════════════════════════════════════")
+    print("\n" + "=" * 60)
+    print("  [模块 1/2] 冗余重复代码扫描 - jscpd")
+    print("=" * 60)
 
     results: List[Dict[str, Any]] = []
 
     if not shutil.which("jscpd") and not shutil.which("npx"):
-        print("  ⏭️  跳过：jscpd / npx 未安装。")
+        print(f"  {SYM_SKIP} 跳过：jscpd / npx 未安装。")
         return results
 
     try:
@@ -197,15 +292,15 @@ def scan_duplicate(project_root: Path, temp_dir: str) -> List[Dict[str, Any]]:
                 break
 
         if not report_path:
-            print("  ℹ️  jscpd 未生成报告，未发现重复代码。")
+            print(f"  {SYM_INFO} jscpd 未生成报告，未发现重复代码。")
             return results
 
-        print(f"  📄 解析报告: {report_path}")
+        print(f"  {SYM_INFO} 解析报告: {report_path}")
         with open(report_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         duplicates = data.get("duplicates", [])
-        print(f"  🔍 发现 {len(duplicates)} 处重复")
+        print(f"  {SYM_INFO} 发现 {len(duplicates)} 处重复")
 
         for dup in duplicates:
             first = dup.get("first", {})
@@ -227,8 +322,8 @@ def scan_duplicate(project_root: Path, temp_dir: str) -> List[Dict[str, Any]]:
 
             s_filename = os.path.basename(s_file)
             desc = (
-                f"该代码块与文件「{s_filename}」第 {s_start}-{s_end} 行存在重复"
-                f"（文件: {to_relative_path(project_root, s_file)}）"
+                f"该代码块与文件 [{s_filename}] 第 {s_start}-{s_end} 行存在重复"
+                f" (文件: {to_relative_path(project_root, s_file)})"
             )
 
             results.append({
@@ -243,7 +338,7 @@ def scan_duplicate(project_root: Path, temp_dir: str) -> List[Dict[str, Any]]:
         return results
 
     except Exception as e:
-        print(f"  ❌ jscpd 扫描异常: {e}")
+        print(f"  {SYM_ERR} jscpd 扫描异常: {e}")
         return results
 
 
@@ -264,16 +359,16 @@ def scan_dead_code(project_root: Path, temp_dir: str) -> List[Dict[str, Any]]:
     Returns:
         扫描结果列表。
     """
-    print("\n═══════════════════════════════════════════════")
-    print("  [模块 2/2] 无用代码扫描 — Qodana JVM Community")
-    print("═══════════════════════════════════════════════")
+    print("\n" + "=" * 60)
+    print("  [模块 2/2] 无用代码扫描 - Qodana JVM Community")
+    print("=" * 60)
 
     results: List[Dict[str, Any]] = []
     results_dir = os.path.join(temp_dir, "qodana-results")
     os.makedirs(results_dir, exist_ok=True)
 
     if not shutil.which("qodana"):
-        print("  ⏭️  跳过：qodana CLI 未安装。")
+        print(f"  {SYM_SKIP} 跳过：qodana CLI 未安装。")
         return results
 
     try:
@@ -294,17 +389,16 @@ def scan_dead_code(project_root: Path, temp_dir: str) -> List[Dict[str, Any]]:
                     sarif_paths.append(os.path.join(root, f))
 
         if not sarif_paths:
-            # 兜底：尝试临时目录下的文件名匹配
             fallback = os.path.join(results_dir, "qodana.sarif.json")
             if os.path.exists(fallback):
                 sarif_paths.append(fallback)
 
         if not sarif_paths:
-            print("  ℹ️  Qodana 未生成 SARIF 报告。")
+            print(f"  {SYM_INFO} Qodana 未生成 SARIF 报告。")
             return results
 
         sarif_path = sarif_paths[0]
-        print(f"  📄 解析报告: {sarif_path}")
+        print(f"  {SYM_INFO} 解析报告: {sarif_path}")
 
         with open(sarif_path, "r", encoding="utf-8", errors="replace") as f:
             sarif = json.load(f)
@@ -355,14 +449,14 @@ def scan_dead_code(project_root: Path, temp_dir: str) -> List[Dict[str, Any]]:
                     "description": msg.strip() if msg else f"检测到 {rule_id}",
                 })
 
-        print(f"  🔍 发现 {len(results)} 处无用代码问题")
+        print(f"  {SYM_INFO} 发现 {len(results)} 处无用代码问题")
         return results
 
     except subprocess.TimeoutExpired:
-        print("  ❌ Qodana 扫描超时。")
+        print(f"  {SYM_ERR} Qodana 扫描超时。")
         return results
     except Exception as e:
-        print(f"  ❌ Qodana 扫描异常: {e}")
+        print(f"  {SYM_ERR} Qodana 扫描异常: {e}")
         return results
 
 
@@ -388,9 +482,9 @@ def write_excel(
     Returns:
         最终输出的文件路径。
     """
-    print("\n═══════════════════════════════════════════════")
+    print("\n" + "=" * 60)
     print("  [输出] 聚合结果 & 生成 Excel")
-    print("═══════════════════════════════════════════════")
+    print("=" * 60)
 
     # 构建 DataFrame
     df_dup = pd.DataFrame(dup_results) if dup_results else pd.DataFrame(columns=HEADER_DUPLICATE)
@@ -422,7 +516,7 @@ def write_excel(
         df_dup.to_excel(writer, sheet_name="冗余重复代码", index=False)
         df_dead.to_excel(writer, sheet_name="无用代码", index=False)
 
-    print(f"  💾 已写入: {abspath}")
+    print(f"  {SYM_INFO} 已写入: {abspath}")
 
     # 美化格式
     wb = load_workbook(abspath)
@@ -456,10 +550,10 @@ def write_excel(
         ws.freeze_panes = "A2"
 
     wb.save(abspath)
-    print("  🎨 格式美化完成。")
-    print(f"\n  ✅ 报告: {abspath}")
-    print(f"     「冗余重复代码」: {len(df_dup)} 条")
-    print(f"     「无用代码」:      {len(df_dead)} 条")
+    print(f"  {SYM_OK} 格式美化完成。")
+    print(f"\n  {SYM_DONE} 报告: {abspath}")
+    print(f"      - 冗余重复代码: {len(df_dup)} 条")
+    print(f"      - 无用代码:      {len(df_dead)} 条")
 
     return abspath
 
@@ -470,73 +564,90 @@ def write_excel(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Java Code Scanner — 冗余代码 + 无用代码扫描工具",
+        description="Java Code Scanner - 冗余代码 + 无用代码扫描工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例:
   python main.py --project-path /path/to/java/project
   python main.py --project-path /path --output ./report.xlsx
-  SKIP_JSCPD=1 python main.py --project-path /path
+  set SKIP_JSCPD=1 && python main.py --project-path /path    (Windows)
+  SKIP_JSCPD=1 python main.py --project-path /path           (Linux/macOS)
         """,
     )
     parser.add_argument("--project-path", required=True, help="待扫描的 Java 项目根目录")
     parser.add_argument("--output", default=None, help="Excel 报告输出路径")
     args = parser.parse_args()
 
-    print("🍄 Java Code Scanner Skill v1.0.0")
-    print()
+    print("=" * 60)
+    print("  Java Code Scanner Skill v1.1.0")
+    print("  冗余重复代码扫描 + 无用代码扫描")
+    print("=" * 60)
 
     # 1. 验证项目路径
     try:
         project_root = resolve_project_path(args.project_path)
-        print(f"  📂 项目: {project_root}")
+        print(f"\n  {SYM_INFO} 项目: {project_root}")
     except (FileNotFoundError, NotADirectoryError) as e:
-        print(f"  ❌ {e}")
+        print(f"  {SYM_ERR} {e}")
         sys.exit(1)
 
     output_path = args.output or os.path.join(str(project_root), "java-code-report.xlsx")
-    print(f"  📄 输出: {output_path}")
-    print(f"  🕐 {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print()
+    print(f"  {SYM_INFO} 输出: {output_path}")
+    print(f"  {SYM_INFO} 时间: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # 2. 创建临时目录
+    # 2. 环境检查
+    env_status = check_environment()
+
+    # 3. 创建临时目录
     tmpdir = tempfile.TemporaryDirectory(prefix="java-code-scanner-")
-    print(f"  📁 临时: {tmpdir.name}\n")
+    print(f"\n  {SYM_INFO} 临时目录: {tmpdir.name}")
 
     dup_results: List[Dict[str, Any]] = []
     dead_results: List[Dict[str, Any]] = []
 
     try:
-        # 3. 冗余代码扫描
-        if os.environ.get("SKIP_JSCPD", "").lower() in ("1", "true", "yes"):
-            print("  ⏭️  SKIP_JSCPD=1，跳过。")
+        # 4. 冗余代码扫描
+        skip_jscpd = os.environ.get("SKIP_JSCPD", "").lower() in ("1", "true", "yes")
+        if skip_jscpd:
+            print(f"\n  {SYM_SKIP} SKIP_JSCPD=1，跳过。")
+        elif not env_status.get("jscpd", False):
+            print(f"\n  {SYM_SKIP} jscpd 未安装，跳过冗余代码扫描。")
         else:
             dup_results = scan_duplicate(project_root, tmpdir.name)
 
-        # 4. 无用代码扫描
-        if os.environ.get("SKIP_QODANA", "").lower() in ("1", "true", "yes"):
-            print("  ⏭️  SKIP_QODANA=1，跳过。")
+        # 5. 无用代码扫描
+        skip_qodana = os.environ.get("SKIP_QODANA", "").lower() in ("1", "true", "yes")
+        if skip_qodana:
+            print(f"\n  {SYM_SKIP} SKIP_QODANA=1，跳过。")
+        elif not env_status.get("qodana", False):
+            print(f"\n  {SYM_SKIP} qodana CLI 未安装，跳过无用代码扫描。")
         else:
             dead_results = scan_dead_code(project_root, tmpdir.name)
 
-        # 5. 生成 Excel（仅当有结果时）
+        # 6. 生成 Excel（仅当有结果时）
         total = len(dup_results) + len(dead_results)
+        print()
         if total == 0:
-            print("\n  ℹ️  两次扫描均未发现问题，跳过 Excel 生成。")
+            print(f"  {SYM_INFO} 两次扫描均未发现问题，跳过 Excel 生成。")
         else:
             write_excel(dup_results, dead_results, output_path)
 
-        # 6. 汇总
-        print(f"\n  📊 共计 {total} 处问题")
+        # 7. 汇总
+        print(f"\n  {'=' * 58}")
+        print(f"  扫描汇总: 共 {total} 处问题")
+        print(f"    - 冗余重复代码: {len(dup_results)} 处")
+        print(f"    - 无用代码:     {len(dead_results)} 处")
+        print(f"  {'=' * 58}")
         if total == 0:
-            print("  ✅ 代码质量不错，没有发现问题！")
+            print(f"\n  {SYM_DONE} 代码质量不错，没有发现问题！")
 
     except KeyboardInterrupt:
-        print("\n  ⛔ 用户中断。")
+        print(f"\n  {SYM_WARN} 用户中断扫描。")
         sys.exit(130)
     except Exception as e:
-        print(f"\n  💥 异常: {e}")
+        print(f"\n  {SYM_ERR} 扫描异常: {e}")
         # 有结果就尝试保存
         if dup_results or dead_results:
+            print(f"  {SYM_INFO} 尝试基于已有结果生成报告...")
             try:
                 write_excel(dup_results, dead_results, output_path)
             except Exception:
@@ -548,7 +659,7 @@ def main():
         except Exception:
             pass
 
-    print("  🎉 扫描完成！")
+    print(f"\n  {SYM_DONE} 扫描完成！")
 
 
 if __name__ == "__main__":
