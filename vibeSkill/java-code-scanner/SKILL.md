@@ -86,7 +86,7 @@ java-code-scanner/
 
 ## Output
 
-The scanner produces an `.xlsx` file with two sheets:
+The scanner only generates an `.xlsx` report when at least one scan module finds issues. If both scans find nothing, no file is written.
 
 ### Sheet: `冗余重复代码` (Duplicate Code)
 

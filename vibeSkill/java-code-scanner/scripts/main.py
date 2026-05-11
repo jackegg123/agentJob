@@ -518,25 +518,29 @@ def main():
         else:
             dead_results = scan_dead_code(project_root, tmpdir.name)
 
-        # 5. 生成 Excel
-        write_excel(dup_results, dead_results, output_path)
+        # 5. 生成 Excel（仅当有结果时）
+        total = len(dup_results) + len(dead_results)
+        if total == 0:
+            print("\n  ℹ️  两次扫描均未发现问题，跳过 Excel 生成。")
+        else:
+            write_excel(dup_results, dead_results, output_path)
 
         # 6. 汇总
-        total = len(dup_results) + len(dead_results)
         print(f"\n  📊 共计 {total} 处问题")
         if total == 0:
-            print("  🎉 代码质量不错，没有发现问题！")
+            print("  ✅ 代码质量不错，没有发现问题！")
 
     except KeyboardInterrupt:
         print("\n  ⛔ 用户中断。")
         sys.exit(130)
     except Exception as e:
         print(f"\n  💥 异常: {e}")
-        # 尝试保存已有结果
-        try:
-            write_excel(dup_results, dead_results, output_path)
-        except Exception:
-            pass
+        # 有结果就尝试保存
+        if dup_results or dead_results:
+            try:
+                write_excel(dup_results, dead_results, output_path)
+            except Exception:
+                pass
         sys.exit(1)
     finally:
         try:
