@@ -63,6 +63,12 @@ steps:
       Execute the Java code scanner against the target project.
       对目标项目执行 Java 代码扫描。
 
+      The scanner will first scan the project structure and list all directories
+      containing Java files. If it's a multi-module project (no Java files in
+      the root), it will ask you to select which module/subdirectory to scan.
+      扫描器会先检查项目结构，列出所有包含 Java 文件的目录。
+      如果是多模块项目，会提示选择要扫描的子模块。
+
       **Linux / macOS:**
       ```bash
       python3 scripts/main.py --project-path "{{project_path}}"

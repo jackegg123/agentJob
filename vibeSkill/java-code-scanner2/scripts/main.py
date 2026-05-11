@@ -202,17 +202,101 @@ def check_environment() -> Dict[str, bool]:
     return status
 
 
+def scan_project_structure(project_root: Path) -> List[str]:
+    """
+    扫描项目目录结构，列出所有包含 .java 文件的子目录（相对路径）。
+    用于让用户选择要扫描的模块/子目录。
+    """
+    print("\n" + "=" * 60)
+    info("扫描项目目录结构...")
+    print("=" * 60)
+
+    java_dirs: Set[str] = set()
+    for root, _, files in os.walk(str(project_root)):
+        has_java = any(f.endswith(".java") for f in files)
+        if has_java:
+            rel = rel_path(project_root, root)
+            if rel:
+                java_dirs.add(rel)
+
+    sorted_dirs = sorted(java_dirs)
+
+    print(f"\n  发现 {len(sorted_dirs)} 个包含 Java 文件的目录：\n")
+    for i, d in enumerate(sorted_dirs, 1):
+        print(f"    [{i}] {d}")
+
+    # 自动检测 Maven/Gradle 模块
+    pom_files = list(project_root.rglob("pom.xml"))
+    gradle_files = list(project_root.rglob("build.gradle")) + list(project_root.rglob("build.gradle.kts"))
+    if pom_files:
+        print(f"\n  检测到 Maven 项目（{len(pom_files)} 个 pom.xml）")
+    if gradle_files:
+        print(f"\n  检测到 Gradle 项目（{len(gradle_files)} 个构建文件）")
+
+    print(f"\n  输入编号选择要扫描的目录，或输入 0 扫描整个项目根目录：")
+    return sorted_dirs
+
+
+def select_scan_target(project_root: Path) -> Path:
+    """
+    交互式选择扫描目标路径。
+    如果用户输入了 --project-path 且项目根有 java 文件，直接使用根目录。
+    否则列出子模块让用户选择。
+    """
+    # 检查根目录是否包含 Java 文件
+    root_has_java = False
+    for f in os.listdir(str(project_root)):
+        if f.endswith(".java"):
+            root_has_java = True
+            break
+    if not root_has_java:
+        for root, _, files in os.walk(str(project_root)):
+            depth = root[len(str(project_root)) + 1:].count(os.sep)
+            if depth == 0 and any(f.endswith(".java") for f in files):
+                root_has_java = True
+                break
+
+    if root_has_java:
+        info("项目根目录包含 Java 文件，直接扫描根目录")
+        return project_root
+
+    # 列出子模块让用户选择
+    dirs = scan_project_structure(project_root)
+
+    if not dirs:
+        warn("项目中未找到任何 Java 文件")
+        return project_root
+
+    try:
+        choice = input("\n  请输入编号: ").strip()
+        idx = int(choice)
+        if idx == 0:
+            info("扫描整个项目根目录")
+            return project_root
+        if 1 <= idx <= len(dirs):
+            selected = project_root / dirs[idx - 1]
+            info(f"扫描子目录: {dirs[idx - 1]}")
+            return selected
+        else:
+            warn(f"无效选择，扫描整个项目根目录")
+            return project_root
+    except (ValueError, IndexError):
+        warn("输入无效，扫描整个项目根目录")
+        return project_root
+
+
 # ====================================================================
 # 模块 1: 冗余代码扫描 (jscpd)
 # ====================================================================
 
-def scan_duplicate(project_root: Path, temp_dir: str) -> List[Dict[str, Any]]:
+def scan_duplicate(scan_target: Path, temp_dir: str, project_root: Path) -> List[Dict[str, Any]]:
     """
     执行 jscpd 扫描并解析 JSON 报告。
 
     Args:
-        project_root: 项目根目录。
+        scan_target: 要扫描的目标目录（可能是子模块）。
         temp_dir: 临时目录，用于存放 jscpd 输出。
+        project_root: 项目根目录，用于计算相对路径。
 
     Returns:
         格式化后的扫描结果列表。
@@ -229,7 +313,7 @@ def scan_duplicate(project_root: Path, temp_dir: str) -> List[Dict[str, Any]]:
         if jscpd_path:
             cmd = [
                 jscpd_path,
-                str(project_root),
+                str(scan_target),
                 "--pattern", "**/*.java",
                 "--reporters", "json",
                 "--output", temp_dir,
@@ -240,7 +324,7 @@ def scan_duplicate(project_root: Path, temp_dir: str) -> List[Dict[str, Any]]:
         else:
             cmd = [
                 "npx", "jscpd",
-                str(project_root),
+                str(scan_target),
                 "--pattern", "**/*.java",
                 "--reporters", "json",
                 "--output", temp_dir,
@@ -248,7 +332,7 @@ def scan_duplicate(project_root: Path, temp_dir: str) -> List[Dict[str, Any]]:
                 "--min-lines", "6",
                 "--min-tokens", "50",
             ]
-        run_cmd(cmd, cwd=str(project_root), timeout=600)
+        run_cmd(cmd, cwd=str(scan_target), timeout=600)
 
         # 查找生成的 JSON 报告
         report_path: Optional[str] = None
@@ -332,7 +416,7 @@ def scan_duplicate(project_root: Path, temp_dir: str) -> List[Dict[str, Any]]:
 # 模块 2: 无用代码扫描 (javalang AST)
 # ====================================================================
 
-def scan_dead_code(project_root: Path) -> List[Dict[str, Any]]:
+def scan_dead_code(scan_target: Path, project_root: Path) -> List[Dict[str, Any]]:
     """
     使用 javalang 解析 Java 文件的 AST，检测以下无用代码：
       1. 未使用的 import
@@ -341,7 +425,8 @@ def scan_dead_code(project_root: Path) -> List[Dict[str, Any]]:
       4. 未使用的局部变量
 
     Args:
-        project_root: 项目根目录。
+        scan_target: 要扫描的目标目录（可能是子模块）。
+        project_root: 项目根目录，用于计算相对路径。
 
     Returns:
         格式化后的扫描结果列表。
@@ -356,7 +441,7 @@ def scan_dead_code(project_root: Path) -> List[Dict[str, Any]]:
 
     # 收集所有 Java 文件
     java_files: List[Path] = []
-    for root, _, files in os.walk(str(project_root)):
+    for root, _, files in os.walk(str(scan_target)):
         for f in files:
             if f.endswith(".java"):
                 java_files.append(Path(root) / f)
@@ -847,7 +932,10 @@ Linux/macOS:
     # 2. 环境检查
     env = check_environment()
 
-    # 3. 创建临时目录
+    # 3. 扫描目标路径选择（支持多模块项目）
+    scan_root = select_scan_target(project_root)
+
+    # 4. 创建临时目录
     tmpdir = tempfile.TemporaryDirectory(prefix="java-code-scanner-")
     info(f"临时目录: {tmpdir.name}\n")
 
@@ -855,7 +943,7 @@ Linux/macOS:
     dead_results: List[Dict[str, Any]] = []
 
     try:
-        # 4. 冗余代码扫描
+        # 5. 冗余代码扫描
         skip_jscpd = os.environ.get("SKIP_JSCPD", "").lower() in ("1", "true", "yes")
         skip_jscpd2 = os.environ.get("SKIP_JSCPD2", "").lower() in ("1", "true", "yes")
         if skip_jscpd or skip_jscpd2:
@@ -863,13 +951,13 @@ Linux/macOS:
         elif not env.get("jscpd", False):
             skip("jscpd 未安装，跳过")
         else:
-            dup_results = scan_duplicate(project_root, tmpdir.name)
+            dup_results = scan_duplicate(scan_root, tmpdir.name, project_root)
 
         # 5. 无用代码扫描
         if not env.get("javalang", False):
             skip("javalang 未安装，跳过")
         else:
-            dead_results = scan_dead_code(project_root)
+            dead_results = scan_dead_code(scan_root, project_root)
 
         # 6. 生成 Excel
         write_excel(dup_results, dead_results, output_path)
