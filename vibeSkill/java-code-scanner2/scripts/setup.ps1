@@ -51,7 +51,7 @@ try {
     exit 1
 }
 
-# 步骤 3: 安装 jscpd
+# 步骤 3: 安装 jscpd 并确保 PATH 生效
 Write-Host "[3/3] 安装 jscpd..." -ForegroundColor Yellow
 try {
     $jscpdVer = jscpd --version 2>&1
@@ -67,6 +67,28 @@ try {
         Write-Host "  (需要先安装 Node.js: https://nodejs.org/)" -ForegroundColor Yellow
         exit 1
     }
+}
+
+# 确保 npm 全局 bin 目录在 PATH 中（当前会话）
+$npmPrefix = npm config get prefix 2>$null
+if ($npmPrefix) {
+    $npmBinPath = Join-Path $npmPrefix ""
+    $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    if ($currentPath -notlike "*$npmBinPath*") {
+        Write-Host "  [INFO] 将 npm 全局 bin 目录添加到用户 PATH: $npmBinPath" -ForegroundColor Yellow
+        [Environment]::SetEnvironmentVariable("Path", "$currentPath;$npmBinPath", "User")
+    }
+    # 刷新当前会话 PATH
+    $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+}
+
+# 再次确认 jscpd 可用
+$jscpdCheck = Get-Command jscpd -ErrorAction SilentlyContinue
+if (-not $jscpdCheck) {
+    Write-Host "  [WARN] jscpd 未在 PATH 中找到。打开新终端窗口后再试。" -ForegroundColor Yellow
+    Write-Host "         或手动添加 npm 全局 bin 到系统 PATH 环境变量。" -ForegroundColor Yellow
+} else {
+    Write-Host "  [OK] jscpd 路径: $($jscpdCheck.Source)" -ForegroundColor Green
 }
 
 Write-Host ""

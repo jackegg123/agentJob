@@ -224,16 +224,30 @@ def scan_duplicate(project_root: Path, temp_dir: str) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
 
     try:
-        cmd = [
-            "npx", "jscpd",
-            str(project_root),
-            "--pattern", "**/*.java",
-            "--reporters", "json",
-            "--output", temp_dir,
-            "--threshold", "0",
-            "--min-lines", "6",
-            "--min-tokens", "50",
-        ]
+        # Windows 下 npx 可能找不到 PATH，先尝试直接使用 jscpd
+        jscpd_path = shutil.which("jscpd")
+        if jscpd_path:
+            cmd = [
+                jscpd_path,
+                str(project_root),
+                "--pattern", "**/*.java",
+                "--reporters", "json",
+                "--output", temp_dir,
+                "--threshold", "0",
+                "--min-lines", "6",
+                "--min-tokens", "50",
+            ]
+        else:
+            cmd = [
+                "npx", "jscpd",
+                str(project_root),
+                "--pattern", "**/*.java",
+                "--reporters", "json",
+                "--output", temp_dir,
+                "--threshold", "0",
+                "--min-lines", "6",
+                "--min-tokens", "50",
+            ]
         run_cmd(cmd, cwd=str(project_root), timeout=600)
 
         # 查找生成的 JSON 报告

@@ -42,6 +42,9 @@ steps:
       windows:
         command: >
           powershell -ExecutionPolicy ByPass -File scripts/setup.ps1
+          
+          # 安装完成后请关闭当前终端重新打开，确保 PATH 刷新
+          # 然后执行 Run 步骤
 
   - id: Run
     description: |
