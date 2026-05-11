@@ -42,8 +42,8 @@ A fully-featured Tetris game built as a single HTML file.
 A collection of custom skills developed through **Vibe Coding** methodology.
 
 - **Location**: `vibeSkill/`
-- **Description**: Skills for OpenClaw agents, built collaboratively with OpenClaw + Claude Code (DeepSeek API).
-- **Development approach**: Vibe Coding — iterative, conversational development where AI assists in writing, testing, and refining code.
+- **Description**: Skills for OpenClaw agents, built collaboratively with **OpenClaw + Claude Code (DeepSeek API)**.
+- **Development approach**: Vibe Coding — iterative, conversational development where the AI agent (OpenClaw/小香菇) orchestrates Claude Code to write, test, and refine code.
 - Each skill is structured as a standalone directory with its own SKILL.md and implementation files.
 
 ## Getting Started
