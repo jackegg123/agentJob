@@ -261,7 +261,6 @@ def scan_duplicate(project_root: Path, temp_dir: str) -> List[Dict[str, Any]]:
                 break
 
         if not report_path:
-            # 兜底：遍历所有 json 文件
             for root, _, files in os.walk(temp_dir):
                 for f in files:
                     if f.endswith(".json"):
@@ -282,37 +281,45 @@ def scan_duplicate(project_root: Path, temp_dir: str) -> List[Dict[str, Any]]:
         info(f"发现 {len(duplicates)} 处重复")
 
         for dup in duplicates:
-            first = dup.get("first", {})
-            second = dup.get("second", {})
+            # 每个 duplicate 单独 try-except，防止异常数据阻断后续
+            try:
+                first = dup.get("first", {})
+                second = dup.get("second", {})
 
-            def get_line(loc) -> int:
-                """获取行号，兼容 dict 或 int 格式。"""
-                if isinstance(loc, dict):
-                    return loc.get("line", 0)
-                return loc or 0
+                def get_line(loc) -> int:
+                    if isinstance(loc, dict):
+                        return loc.get("line", 0)
+                    return loc or 0
 
-            f_file = first.get("name", "") or first.get("path", "")
-            f_start = get_line(first.get("start", first.get("startLine", 0)))
-            f_end = get_line(first.get("end", first.get("endLine", 0)))
+                f_file = first.get("name", "") or first.get("path", "")
+                if not f_file:
+                    continue
+                f_start = get_line(first.get("start", first.get("startLine", 0)))
+                f_end = get_line(first.get("end", first.get("endLine", 0)))
 
-            s_file = second.get("name", "") or second.get("path", "")
-            s_start = get_line(second.get("start", second.get("startLine", 0)))
-            s_end = get_line(second.get("end", second.get("endLine", 0)))
+                s_file = second.get("name", "") or second.get("path", "")
+                if not s_file:
+                    continue
+                s_start = get_line(second.get("start", second.get("startLine", 0)))
+                s_end = get_line(second.get("end", second.get("endLine", 0)))
 
-            s_filename = os.path.basename(s_file)
-            desc = (
-                f"该代码块与文件 [{s_filename}] 第 {s_start}-{s_end} 行存在重复"
-                f" (文件: {rel_path(project_root, s_file)})"
-            )
+                s_filename = os.path.basename(s_file)
+                desc = (
+                    f"该代码块与文件 [{s_filename}] 第 {s_start}-{s_end} 行存在重复"
+                    f" (文件: {rel_path(project_root, s_file)})"
+                )
 
-            results.append({
-                "relative_path": rel_path(project_root, f_file),
-                "filename": os.path.basename(f_file),
-                "start_line": f_start,
-                "end_line": f_end,
-                "issue_type": "冗余重复代码",
-                "description": desc,
-            })
+                results.append({
+                    "relative_path": rel_path(project_root, f_file),
+                    "filename": os.path.basename(f_file),
+                    "start_line": f_start,
+                    "end_line": f_end,
+                    "issue_type": "冗余重复代码",
+                    "description": desc,
+                })
+            except Exception as e:
+                warn(f"解析 duplicate 记录时异常: {e}")
+                continue
 
         return results
 
@@ -344,10 +351,6 @@ def scan_dead_code(project_root: Path) -> List[Dict[str, Any]]:
     print("=" * 60)
 
     import javalang
-    from javalang.tree import (
-        Import, FieldDeclaration, MethodDeclaration,
-        LocalVariableDeclaration, ClassDeclaration,
-    )
 
     results: List[Dict[str, Any]] = []
 
@@ -371,10 +374,12 @@ def scan_dead_code(project_root: Path) -> List[Dict[str, Any]]:
             continue
 
         if file_size > 1024 * 1024:
-            # > 1MB: 仅做简单的 import 正则检测
             warn(f"文件过大，回退正则检测: {rel_path(project_root, str(jf))}")
-            file_results = _dead_code_regex_only(jf, project_root)
-            results.extend(file_results)
+            try:
+                file_results = _dead_code_regex_only(jf, project_root)
+                results.extend(file_results)
+            except Exception as e:
+                warn(f"正则回退检测异常: {e}")
             skipped_count += 1
             continue
 
@@ -391,7 +396,8 @@ def scan_dead_code(project_root: Path) -> List[Dict[str, Any]]:
         try:
             tree = javalang.parse.parse(source)
         except javalang.parser.JavaSyntaxError as e:
-            warn(f"语法错误，跳过: {rel_path(project_root, str(jf))} at line {e.at.line if hasattr(e, 'at') else '?'}")
+            at_line = getattr(e.at, 'line', '?') if hasattr(e, 'at') else '?'
+            warn(f"语法错误，跳过: {rel_path(project_root, str(jf))} at line {at_line}")
             skipped_count += 1
             continue
         except Exception as e:
@@ -402,192 +408,247 @@ def scan_dead_code(project_root: Path) -> List[Dict[str, Any]]:
         parsed_count += 1
         relative = rel_path(project_root, str(jf))
         filename = jf.name
-
-        # ---------- 检测 1: 未使用的 import ----------
         source_lines = source.split("\n")
-        imports_in_file: List[Import] = []
-        for imp in tree.imports:
-            if imp.path:
-                imports_in_file.append(imp)
 
-        for imp in imports_in_file:
-            # 获取 import 的短名称
-            short_name = imp.path.split(".")[-1]
-            if short_name == "*":
-                # 通配符 import: 检查是否有类型使用该包下的内容
-                pkg_prefix = imp.path.rsplit(".", 1)[0] + "."
-                used = False
-                for line_num, line in enumerate(source_lines, 1):
-                    if line.strip().startswith("import"):
-                        continue
-                    if pkg_prefix[:-1] in line or (
-                        short_name := _find_full_qualifier(line, imp.path)
-                    ):
-                        used = True
-                        break
-                if not used:
-                    results.append({
-                        "relative_path": relative,
-                        "filename": filename,
-                        "start_line": (imp.position.line if imp.position else 1),
-                        "end_line": (imp.position.line if imp.position else 1),
-                        "issue_type": "未使用的 import",
-                        "description": f"通配符导入 '{imp.path}' 在文件中未被使用",
-                    })
-                continue
+        # 用 try-except 包裹每个文件的完整分析，防止异常中断整个扫描
+        try:
+            _analyze_file(tree, source_lines, relative, filename, results)
+        except Exception as e:
+            warn(f"文件分析异常 ({relative}): {e}")
+            skipped_count += 1
+            continue
 
-            # 非通配符: 检查 short_name 是否在源码中出现
-            used_in_source = False
-            for line_num, line in enumerate(source_lines, 1):
-                if line.strip().startswith("import"):
-                    continue
-                # 匹配单词边界，避免误匹配子串
-                if re.search(r'\b' + re.escape(short_name) + r'\b', line):
-                    used_in_source = True
-                    break
-
-            if not used_in_source:
-                results.append({
-                    "relative_path": relative,
-                    "filename": filename,
-                    "start_line": (imp.position.line if imp.position else 1),
-                    "end_line": (imp.position.line if imp.position else 1),
-                    "issue_type": "未使用的 import",
-                    "description": f"import '{imp.path}' 在文件中未被使用",
-                })
-
-        # ---------- 检测 2: 未使用的 private 字段 ----------
-        # 收集所有 private 字段声明
-        private_fields: List[Tuple[FieldDeclaration, str]] = []
-        field_annotation_names: Set[str] = set()
-
-        for path, node in tree:
-            if isinstance(node, FieldDeclaration):
-                modifiers = set(node.modifiers) if node.modifiers else set()
-                if "private" in modifiers:
-                    annotations = set()
-                    if hasattr(node, "annotations") and node.annotations:
-                        for ann in node.annotations:
-                            if hasattr(ann, "name"):
-                                annotations.add(ann.name)
-                    for decl in node.declarators:
-                        field_name = decl.name
-                        # 豁免 serialVersionUID
-                        if field_name == "serialVersionUID":
-                            continue
-                        # 豁免有注入注解的字段
-                        injection_annos = {"Autowired", "Inject", "Resource", "Value"}
-                        if annotations & injection_annos:
-                            field_annotation_names.add(field_name)
-                            continue
-                        private_fields.append((node, field_name))
-
-        used_field_names: Set[str] = set()
-        private_field_names = {fn for _, fn in private_fields}
-        # 跳过豁免字段
-        private_field_names -= field_annotation_names
-
-        for line_num, line in enumerate(source_lines, 1):
-            for fn in private_field_names:
-                if re.search(r'\b' + re.escape(fn) + r'\b', line):
-                    # 检查这一行是不是声明行
-                    is_decl = False
-                    for node, field_name in private_fields:
-                        if fn == field_name and node.position and node.position.line == line_num:
-                            is_decl = True
-                            break
-                    if not is_decl:
-                        used_field_names.add(fn)
-
-        for node, fn in private_fields:
-            if fn in field_annotation_names:
-                continue
-            if fn not in used_field_names:
-                results.append({
-                    "relative_path": relative,
-                    "filename": filename,
-                    "start_line": (node.position.line if node.position else 1),
-                    "end_line": (node.position.line if node.position else 1),
-                    "issue_type": "未使用的 private 字段",
-                    "description": f"private 字段 '{fn}' 声明后未被使用",
-                })
-
-        # ---------- 检测 3: 未使用的 private 方法 ----------
-        private_methods: List[Tuple[MethodDeclaration, str]] = []
-        for path, node in tree:
-            if isinstance(node, MethodDeclaration):
-                modifiers = set(node.modifiers) if node.modifiers else set()
-                if "private" in modifiers:
-                    # 豁免 main 方法
-                    if node.name == "main":
-                        continue
-                    private_methods.append((node, node.name))
-
-        used_methods: Set[str] = set()
-        private_method_names = {mn for _, mn in private_methods}
-
-        for line_num, line in enumerate(source_lines, 1):
-            for mn in private_method_names:
-                if re.search(r'\b' + re.escape(mn) + r'\s*\(', line):
-                    is_def = False
-                    for node, method_name in private_methods:
-                        if mn == method_name and node.position and node.position.line == line_num:
-                            is_def = True
-                            break
-                    if not is_def:
-                        used_methods.add(mn)
-
-        for node, mn in private_methods:
-            if mn not in used_methods:
-                results.append({
-                    "relative_path": relative,
-                    "filename": filename,
-                    "start_line": (node.position.line if node.position else 1),
-                    "end_line": (node.position.line if node.position else 1),
-                    "issue_type": "未使用的 private 方法",
-                    "description": f"private 方法 '{mn}' 定义后未被调用",
-                })
-
-        # ---------- 检测 4: 未使用的局部变量 ----------
-        local_vars: List[Tuple[Any, str, int]] = []  # (node, name, decl_line)
-        for path, node in tree:
-            if isinstance(node, LocalVariableDeclaration):
-                for decl in node.declarators:
-                    lv_name = decl.name
-                    lv_line = node.position.line if node.position else 1
-                    local_vars.append((node, lv_name, lv_line))
-
-        used_locals: Set[str] = set()
-        for line_num, line in enumerate(source_lines, 1):
-            for lv_node, lv_name, decl_line in local_vars:
-                if lv_name in used_locals:
-                    continue
-                if line_num <= decl_line:
-                    continue
-                if re.search(r'\b' + re.escape(lv_name) + r'\b', line):
-                    # 检查是不是在赋值（= 左侧）
-                    if "=" in line and re.search(r'\b' + re.escape(lv_name) + r'\s*=', line):
-                        continue
-                    used_locals.add(lv_name)
-
-        for lv_node, lv_name, decl_line in local_vars:
-            if lv_name not in used_locals:
-                results.append({
-                    "relative_path": relative,
-                    "filename": filename,
-                    "start_line": decl_line,
-                    "end_line": decl_line,
-                    "issue_type": "未使用的局部变量",
-                    "description": f"局部变量 '{lv_name}' 声明后仅赋值未读取",
-                })
-
-        # 进度提示（每 50 个文件报一次）
+        # 进度提示
         if parsed_count % 50 == 0:
             info(f"已分析 {parsed_count}/{len(java_files)} 个文件...")
 
     info(f"分析完成: 成功解析 {parsed_count} 个, 跳过 {skipped_count} 个")
     info(f"发现 {len(results)} 处死代码问题")
     return results
+
+
+# ====================================================================
+# 模块 2 子函数: 单文件分析
+# ====================================================================
+
+def _analyze_file(
+    tree: Any, source_lines: List[str],
+    relative: str, filename: str, results: List[Dict[str, Any]]
+) -> None:
+    """
+    对单个 Java 文件执行 4 种无用代码检测。
+    每种检测独立 try-except，防止单步异常丢弃全部结果。
+    """
+    try:
+        _detect_unused_imports(tree, source_lines, relative, filename, results)
+    except Exception as e:
+        warn(f"  import 检测异常 ({filename}): {e}")
+
+    try:
+        _detect_unused_fields(tree, source_lines, relative, filename, results)
+    except Exception as e:
+        warn(f"  字段检测异常 ({filename}): {e}")
+
+    try:
+        _detect_unused_methods(tree, source_lines, relative, filename, results)
+    except Exception as e:
+        warn(f"  方法检测异常 ({filename}): {e}")
+
+    try:
+        _detect_unused_locals(tree, source_lines, relative, filename, results)
+    except Exception as e:
+        warn(f"  局部变量检测异常 ({filename}): {e}")
+
+
+def _detect_unused_imports(
+    tree: Any, source_lines: List[str],
+    relative: str, filename: str, results: List[Dict[str, Any]]
+) -> None:
+    """检测未使用的 import 语句。"""
+    for imp in tree.imports:
+        if not imp.path:
+            continue
+        try:
+            short_name = imp.path.split(".")[-1]
+            if short_name == "*":
+                pkg_prefix = imp.path.rsplit(".", 1)[0] + "."
+                used = any(
+                    not line.strip().startswith("import") and pkg_prefix[:-1] in line
+                    for line in source_lines
+                )
+            else:
+                used = any(
+                    not line.strip().startswith("import")
+                    and re.search(r'\b' + re.escape(short_name) + r'\b', line)
+                    for line in source_lines
+                )
+            if not used:
+                results.append({
+                    "relative_path": relative, "filename": filename,
+                    "start_line": (imp.position.line if imp.position else 1),
+                    "end_line": (imp.position.line if imp.position else 1),
+                    "issue_type": "未使用的 import",
+                    "description": f"import '{imp.path}' 在文件中未被使用",
+                })
+        except re.error:
+            continue
+        except Exception:
+            continue
+
+
+def _detect_unused_fields(
+    tree: Any, source_lines: List[str],
+    relative: str, filename: str, results: List[Dict[str, Any]]
+) -> None:
+    """检测未使用的 private 字段。"""
+    from javalang.tree import FieldDeclaration
+
+    private_fields = []
+    injection_fields = set()
+    injection_keywords = {"Autowired", "Inject", "Resource", "Value"}
+
+    for path, node in tree:
+        try:
+            if not isinstance(node, FieldDeclaration):
+                continue
+            modifiers = set(node.modifiers) if node.modifiers else set()
+            if "private" not in modifiers:
+                continue
+
+            annotations = set()
+            if hasattr(node, "annotations") and node.annotations:
+                for ann in node.annotations:
+                    if hasattr(ann, "name"):
+                        annotations.add(ann.name)
+
+            for decl in node.declarators:
+                if decl.name == "serialVersionUID":
+                    continue
+                if annotations & injection_keywords:
+                    injection_fields.add(decl.name)
+                    continue
+                private_fields.append((node, decl.name))
+        except Exception:
+            continue
+
+    used_fields = set()
+    for line_num, line in enumerate(source_lines, 1):
+        for fnode, fn in private_fields:
+            if fn in used_fields:
+                continue
+            try:
+                if not re.search(r'\b' + re.escape(fn) + r'\b', line):
+                    continue
+            except re.error:
+                continue
+            if fnode.position and fnode.position.line == line_num:
+                continue
+            used_fields.add(fn)
+
+    for fnode, fn in private_fields:
+        if fn not in used_fields:
+            results.append({
+                "relative_path": relative, "filename": filename,
+                "start_line": (fnode.position.line if fnode.position else 1),
+                "end_line": (fnode.position.line if fnode.position else 1),
+                "issue_type": "未使用的 private 字段",
+                "description": f"private 字段 '{fn}' 声明后未被使用",
+            })
+
+
+def _detect_unused_methods(
+    tree: Any, source_lines: List[str],
+    relative: str, filename: str, results: List[Dict[str, Any]]
+) -> None:
+    """检测未使用的 private 方法。"""
+    from javalang.tree import MethodDeclaration
+
+    private_methods = []
+    for path, node in tree:
+        try:
+            if not isinstance(node, MethodDeclaration):
+                continue
+            modifiers = set(node.modifiers) if node.modifiers else set()
+            if "private" not in modifiers:
+                continue
+            if node.name == "main":
+                continue
+            private_methods.append((node, node.name))
+        except Exception:
+            continue
+
+    used_methods = set()
+    for line_num, line in enumerate(source_lines, 1):
+        for mnode, mn in private_methods:
+            if mn in used_methods:
+                continue
+            try:
+                if not re.search(r'\b' + re.escape(mn) + r'\s*\(', line):
+                    continue
+            except re.error:
+                continue
+            if mnode.position and mnode.position.line == line_num:
+                continue
+            used_methods.add(mn)
+
+    for mnode, mn in private_methods:
+        if mn not in used_methods:
+            results.append({
+                "relative_path": relative, "filename": filename,
+                "start_line": (mnode.position.line if mnode.position else 1),
+                "end_line": (mnode.position.line if mnode.position else 1),
+                "issue_type": "未使用的 private 方法",
+                "description": f"private 方法 '{mn}' 定义后未被调用",
+            })
+
+
+def _detect_unused_locals(
+    tree: Any, source_lines: List[str],
+    relative: str, filename: str, results: List[Dict[str, Any]]
+) -> None:
+    """检测未使用的局部变量（声明后只有赋值没有读取）。"""
+    from javalang.tree import LocalVariableDeclaration
+
+    local_vars = []
+    for path, node in tree:
+        try:
+            if not isinstance(node, LocalVariableDeclaration):
+                continue
+            for decl in node.declarators:
+                decl_line = node.position.line if node.position else 1
+                local_vars.append((decl.name, decl_line))
+        except Exception:
+            continue
+
+    used_locals = set()
+    for line_num, line in enumerate(source_lines, 1):
+        for lv_name, decl_line in local_vars:
+            if lv_name in used_locals:
+                continue
+            if line_num <= decl_line:
+                continue
+            try:
+                if not re.search(r'\b' + re.escape(lv_name) + r'\b', line):
+                    continue
+            except re.error:
+                continue
+            # 仅在等号左侧出现不算"读取"
+            if "=" in line:
+                try:
+                    if re.search(r'\b' + re.escape(lv_name) + r'\s*=', line):
+                        continue
+                except re.error:
+                    pass
+            used_locals.add(lv_name)
+
+    for lv_name, decl_line in local_vars:
+        if lv_name not in used_locals:
+            results.append({
+                "relative_path": relative, "filename": filename,
+                "start_line": decl_line, "end_line": decl_line,
+                "issue_type": "未使用的局部变量",
+                "description": f"局部变量 '{lv_name}' 声明后仅赋值未读取",
+            })
 
 
 def _dead_code_regex_only(file_path: Path, project_root: Path) -> List[Dict[str, Any]]:
@@ -609,43 +670,35 @@ def _dead_code_regex_only(file_path: Path, project_root: Path) -> List[Dict[str,
     import_pattern = re.compile(r'^import\s+(static\s+)?([a-zA-Z0-9_.*]+)\s*;')
 
     for line_num, line in enumerate(source_lines, 1):
-        m = import_pattern.match(line.strip())
-        if not m:
-            continue
-        full_path = m.group(2)
-        short_name = full_path.split(".")[-1]
-        if short_name == "*":
-            continue
-        # 检查是否在文件中被引用
-        used = False
-        for i, sl in enumerate(source_lines, 1):
-            if i == line_num:
+        try:
+            m = import_pattern.match(line.strip())
+            if not m:
                 continue
-            if re.search(r'\b' + re.escape(short_name) + r'\b', sl):
-                used = True
-                break
-        if not used:
-            results.append({
-                "relative_path": relative,
-                "filename": filename,
-                "start_line": line_num,
-                "end_line": line_num,
-                "issue_type": "未使用的 import (正则回退)",
-                "description": f"import '{full_path}' 在文件中未被使用",
-            })
+            full_path = m.group(2)
+            short_name = full_path.split(".")[-1]
+            if short_name == "*":
+                continue
+
+            used = False
+            for i, sl in enumerate(source_lines, 1):
+                if i == line_num:
+                    continue
+                if re.search(r'\b' + re.escape(short_name) + r'\b', sl):
+                    used = True
+                    break
+            if not used:
+                results.append({
+                    "relative_path": relative, "filename": filename,
+                    "start_line": line_num, "end_line": line_num,
+                    "issue_type": "未使用的 import (正则回退)",
+                    "description": f"import '{full_path}' 在文件中未被使用",
+                })
+        except re.error:
+            continue
+        except Exception:
+            continue
 
     return results
-
-
-def _find_full_qualifier(line: str, import_path: str) -> Optional[str]:
-    """
-    在代码行中查找是否使用了某个 import 路径中的全限定类名。
-    例如 import 'com.example.util'，检查行中是否出现 'com.example.util.SomeClass'。
-    """
-    pkg_part = import_path.rstrip("*").rstrip(".")
-    if pkg_part and pkg_part in line:
-        return pkg_part
-    return None
 
 
 # ====================================================================
@@ -674,66 +727,82 @@ def write_excel(
     info("聚合结果 & 生成 Excel")
     print("=" * 60)
 
-    # 构建 DataFrame
     header_dup = HEADER_DUPLICATE
     header_dead = HEADER_DEAD_CODE
 
-    df_dup = pd.DataFrame(dup_results) if dup_results else pd.DataFrame(columns=header_dup)
-    if not df_dup.empty:
-        df_dup = df_dup.rename(columns={
-            "relative_path": header_dup[0], "filename": header_dup[1],
-            "start_line": header_dup[2], "end_line": header_dup[3],
-            "issue_type": header_dup[4], "description": header_dup[5],
-        })[header_dup]
+    try:
+        df_dup = pd.DataFrame(dup_results) if dup_results else pd.DataFrame(columns=header_dup)
+        if not df_dup.empty:
+            df_dup = df_dup.rename(columns={
+                "relative_path": header_dup[0], "filename": header_dup[1],
+                "start_line": header_dup[2], "end_line": header_dup[3],
+                "issue_type": header_dup[4], "description": header_dup[5],
+            })[header_dup]
 
-    df_dead = pd.DataFrame(dead_results) if dead_results else pd.DataFrame(columns=header_dead)
-    if not df_dead.empty:
-        df_dead = df_dead.rename(columns={
-            "relative_path": header_dead[0], "filename": header_dead[1],
-            "start_line": header_dead[2], "end_line": header_dead[3],
-            "issue_type": header_dead[4], "description": header_dead[5],
-        })[header_dead]
+        df_dead = pd.DataFrame(dead_results) if dead_results else pd.DataFrame(columns=header_dead)
+        if not df_dead.empty:
+            df_dead = df_dead.rename(columns={
+                "relative_path": header_dead[0], "filename": header_dead[1],
+                "start_line": header_dead[2], "end_line": header_dead[3],
+                "issue_type": header_dead[4], "description": header_dead[5],
+            })[header_dead]
 
-    abspath = os.path.abspath(output_path)
-    os.makedirs(os.path.dirname(abspath) or ".", exist_ok=True)
+        abspath = os.path.abspath(output_path)
+        os.makedirs(os.path.dirname(abspath) or ".", exist_ok=True)
 
-    with pd.ExcelWriter(abspath, engine="openpyxl") as writer:
-        df_dup.to_excel(writer, sheet_name="冗余重复代码", index=False)
-        df_dead.to_excel(writer, sheet_name="无用代码", index=False)
+        with pd.ExcelWriter(abspath, engine="openpyxl") as writer:
+            df_dup.to_excel(writer, sheet_name="冗余重复代码", index=False)
+            df_dead.to_excel(writer, sheet_name="无用代码", index=False)
 
-    info(f"已写入: {abspath}")
+        info(f"已写入: {abspath}")
 
-    # 美化格式
-    wb = load_workbook(abspath)
-    for sheet in ("冗余重复代码", "无用代码"):
-        ws = wb[sheet]
-        for cell in ws[1]:
-            cell.font = HEADER_FONT
-            cell.fill = HEADER_FILL
-            cell.alignment = HEADER_ALIGN
-            cell.border = CELL_BORDER
-        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
-            for cell in row:
-                cell.alignment = CELL_ALIGN
-                cell.border = CELL_BORDER
-        for ci in range(1, ws.max_column + 1):
-            cl = chr(64 + ci)
-            max_w = 10
-            for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=ci, max_col=ci):
-                for cell in row:
-                    if cell.value:
-                        w = sum(2 if ord(c) > 127 else 1 for c in str(cell.value))
-                        max_w = max(max_w, w)
-            ws.column_dimensions[cl].width = min(max_w + 2, 80)
-        ws.freeze_panes = "A2"
+        # 美化格式
+        _format_excel(abspath)
 
-    wb.save(abspath)
-    ok("格式美化完成")
-    print(f"\n  [DONE] 报告: {abspath}")
-    print(f"         - 冗余重复代码: {len(df_dup)} 条")
-    print(f"         - 无用代码:      {len(df_dead)} 条")
+        ok("格式美化完成")
+        print(f"\n  [DONE] 报告: {abspath}")
+        print(f"         - 冗余重复代码: {len(df_dup)} 条")
+        print(f"         - 无用代码:      {len(df_dead)} 条")
 
-    return abspath
+        return abspath
+
+    except Exception as e:
+        err(f"Excel 写入异常: {e}")
+        return None
+
+
+def _format_excel(filepath: str) -> None:
+    """美化 Excel 文件格式，异常不影响主流程。"""
+    try:
+        wb = load_workbook(filepath)
+        for sheet in ("冗余重复代码", "无用代码"):
+            ws = wb[sheet]
+            try:
+                for cell in ws[1]:
+                    cell.font = HEADER_FONT
+                    cell.fill = HEADER_FILL
+                    cell.alignment = HEADER_ALIGN
+                    cell.border = CELL_BORDER
+                for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+                    for cell in row:
+                        cell.alignment = CELL_ALIGN
+                        cell.border = CELL_BORDER
+                for ci in range(1, ws.max_column + 1):
+                    cl = chr(64 + ci)
+                    max_w = 10
+                    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=ci, max_col=ci):
+                        for cell in row:
+                            if cell.value:
+                                w = sum(2 if ord(c) > 127 else 1 for c in str(cell.value))
+                                max_w = max(max_w, w)
+                    ws.column_dimensions[cl].width = min(max_w + 2, 80)
+                ws.freeze_panes = "A2"
+            except Exception:
+                warn(f"Sheet '{sheet}' 美化异常，跳过")
+                continue
+        wb.save(filepath)
+    except Exception as e:
+        warn(f"Excel 格式美化异常: {e}")
 
 
 # ====================================================================
