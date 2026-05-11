@@ -289,7 +289,7 @@ def select_scan_target(project_root: Path) -> Path:
 # 模块 1: 冗余代码扫描 (jscpd)
 # ====================================================================
 
-def scan_duplicate(scan_target: Path, temp_dir: str, project_root: Path) -> List[Dict[str, Any]]:
+def scan_duplicate(scan_target: Path, temp_dir: str, project_root: Path) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """
     执行 jscpd 扫描并解析 JSON 报告。
 
@@ -299,13 +299,26 @@ def scan_duplicate(scan_target: Path, temp_dir: str, project_root: Path) -> List
         project_root: 项目根目录，用于计算相对路径。
 
     Returns:
-        格式化后的扫描结果列表。
+        (结果列表, 错误信息)。错误信息为 None 表示扫描正常完成。
     """
     print("\n" + "=" * 60)
     info("冗余重复代码扫描 - jscpd")
     print("=" * 60)
 
     results: List[Dict[str, Any]] = []
+    error_msg: Optional[str] = None
+
+    # 先检查目标目录是否有 Java 文件
+    java_count = 0
+    for root, _, files in os.walk(str(scan_target)):
+        java_count += sum(1 for f in files if f.endswith(".java"))
+
+    if java_count == 0:
+        err_msg = f"目标目录中没有找到任何 Java 文件: {scan_target}"
+        err(err_msg)
+        return results, err_msg
+
+    info(f"目标目录包含 {java_count} 个 Java 文件")
 
     try:
         # Windows 下 npx 可能找不到 PATH，先尝试直接使用 jscpd
@@ -332,7 +345,19 @@ def scan_duplicate(scan_target: Path, temp_dir: str, project_root: Path) -> List
                 "--min-lines", "6",
                 "--min-tokens", "50",
             ]
-        run_cmd(cmd, cwd=str(scan_target), timeout=600)
+        result = run_cmd(cmd, cwd=str(scan_target), timeout=600)
+
+        # 检查 jscpd 输出是否有错误提示
+        stderr_text = result.stderr.strip() if result.stderr else ""
+        if result.returncode != 0:
+            if "No files found" in stderr_text or "no files" in stderr_text.lower():
+                err_msg = f"jscpd 未找到匹配的 Java 文件（退出码 {result.returncode}）: {stderr_text[:300]}"
+                err(err_msg)
+                return results, err_msg
+            else:
+                err_msg = f"jscpd 执行异常（退出码 {result.returncode}）: {stderr_text[:300]}"
+                err(err_msg)
+                return results, err_msg
 
         # 查找生成的 JSON 报告
         report_path: Optional[str] = None
@@ -355,7 +380,7 @@ def scan_duplicate(scan_target: Path, temp_dir: str, project_root: Path) -> List
 
         if not report_path:
             info("jscpd 未生成报告，未发现重复代码。")
-            return results
+            return results, None
 
         info(f"解析报告: {report_path}")
         with open(report_path, "r", encoding="utf-8") as f:
@@ -365,7 +390,6 @@ def scan_duplicate(scan_target: Path, temp_dir: str, project_root: Path) -> List
         info(f"发现 {len(duplicates)} 处重复")
 
         for dup in duplicates:
-            # 每个 duplicate 单独 try-except，防止异常数据阻断后续
             try:
                 first = dup.get("first", {})
                 second = dup.get("second", {})
@@ -405,18 +429,27 @@ def scan_duplicate(scan_target: Path, temp_dir: str, project_root: Path) -> List
                 warn(f"解析 duplicate 记录时异常: {e}")
                 continue
 
-        return results
+        return results, None
 
+    except subprocess.TimeoutExpired:
+        err_msg = "jscpd 扫描超时（超过 600 秒）"
+        err(err_msg)
+        return results, err_msg
+    except FileNotFoundError:
+        err_msg = "jscpd 命令未找到，请确认已安装: npm install -g jscpd"
+        err(err_msg)
+        return results, err_msg
     except Exception as e:
-        err(f"jscpd 扫描异常: {e}")
-        return results
+        err_msg = f"jscpd 扫描异常: {e}"
+        err(err_msg)
+        return results, err_msg
 
 
 # ====================================================================
 # 模块 2: 无用代码扫描 (javalang AST)
 # ====================================================================
 
-def scan_dead_code(scan_target: Path, project_root: Path) -> List[Dict[str, Any]]:
+def scan_dead_code(scan_target: Path, project_root: Path) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """
     使用 javalang 解析 Java 文件的 AST，检测以下无用代码：
       1. 未使用的 import
@@ -509,7 +542,7 @@ def scan_dead_code(scan_target: Path, project_root: Path) -> List[Dict[str, Any]
 
     info(f"分析完成: 成功解析 {parsed_count} 个, 跳过 {skipped_count} 个")
     info(f"发现 {len(results)} 处死代码问题")
-    return results
+    return results, None
 
 
 # ====================================================================
@@ -794,16 +827,19 @@ def write_excel(
     dup_results: List[Dict[str, Any]],
     dead_results: List[Dict[str, Any]],
     output_path: str,
+    scan_errors: Optional[List[str]] = None,
 ) -> Optional[str]:
     """
     将扫描结果写入格式化的 Excel 文件。
-    如果无结果则不生成文件。
+    如果无结果但有扫描异常信息，仍生成报告记录异常。
 
     Returns:
-        输出路径，或 None（无结果时）。
+        输出路径，或 None（无结果且无异常时）。
     """
     total = len(dup_results) + len(dead_results)
-    if total == 0:
+    has_errors = scan_errors and len(scan_errors) > 0
+
+    if total == 0 and not has_errors:
         print("\n" + "=" * 60)
         info("两次扫描均未发现问题，跳过 Excel 生成。")
         return None
@@ -831,6 +867,21 @@ def write_excel(
                 "start_line": header_dead[2], "end_line": header_dead[3],
                 "issue_type": header_dead[4], "description": header_dead[5],
             })[header_dead]
+
+        # 如果有扫描异常，在无用代码 Sheet 中添加说明行
+        if has_errors:
+            error_rows = []
+            for i, err_msg in enumerate(scan_errors):
+                error_rows.append({
+                    header_dead[0]: "",
+                    header_dead[1]: "",
+                    header_dead[2]: "",
+                    header_dead[3]: "",
+                    header_dead[4]: f"扫描异常 #{i+1}",
+                    header_dead[5]: err_msg,
+                })
+            df_error = pd.DataFrame(error_rows)
+            df_dead = pd.concat([df_dead, df_error], ignore_index=True) if not df_dead.empty else df_error
 
         abspath = os.path.abspath(output_path)
         os.makedirs(os.path.dirname(abspath) or ".", exist_ok=True)
@@ -941,6 +992,7 @@ Linux/macOS:
 
     dup_results: List[Dict[str, Any]] = []
     dead_results: List[Dict[str, Any]] = []
+    scan_errors: List[str] = []  # 记录扫描异常信息，写入报告中
 
     try:
         # 5. 冗余代码扫描
@@ -951,16 +1003,24 @@ Linux/macOS:
         elif not env.get("jscpd", False):
             skip("jscpd 未安装，跳过")
         else:
-            dup_results = scan_duplicate(scan_root, tmpdir.name, project_root)
+            dup_results, dup_err = scan_duplicate(scan_root, tmpdir.name, project_root)
+            if dup_err:
+                scan_errors.append(f"[冗余代码] {dup_err}")
 
         # 5. 无用代码扫描
         if not env.get("javalang", False):
             skip("javalang 未安装，跳过")
         else:
-            dead_results = scan_dead_code(scan_root, project_root)
+            dead_results, dead_err = scan_dead_code(scan_root, project_root)
+            if dead_err:
+                scan_errors.append(f"[无用代码] {dead_err}")
 
-        # 6. 生成 Excel
-        write_excel(dup_results, dead_results, output_path)
+        # 6. 生成 Excel（如果有异常信息也记录）
+        if scan_errors:
+            info(f"扫描过程存在 {len(scan_errors)} 个异常")
+            for se in scan_errors:
+                err(se)
+        write_excel(dup_results, dead_results, output_path, scan_errors)
 
         # 7. 汇总
         total = len(dup_results) + len(dead_results)
