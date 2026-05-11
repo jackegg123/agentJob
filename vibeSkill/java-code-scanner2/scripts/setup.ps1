@@ -42,7 +42,8 @@ try {
 Write-Host "[2/3] 安装 Python 依赖 (javalang, pandas, openpyxl)..." -ForegroundColor Yellow
 $reqFile = Join-Path $PSScriptRoot "..\requirements.txt"
 try {
-    pip install -r $reqFile
+    pip install --timeout 60 -r $reqFile
+    if ($LASTEXITCODE -ne 0) { throw "pip 退出码: $LASTEXITCODE" }
     Write-Host "  [OK] Python 依赖安装完成" -ForegroundColor Green
 } catch {
     Write-Host "  [ERR] Python 依赖安装失败: $_" -ForegroundColor Red

@@ -29,12 +29,16 @@ if (-not (Test-Path $ProjectPath)) {
 Write-Host "[INFO] 项目: $ProjectPath" -ForegroundColor Green
 Write-Host ""
 
-$cmd = "python scripts\main.py --project-path ""$ProjectPath"""
+$python = Get-Command python | Select-Object -ExpandProperty Source
+$scriptPath = Join-Path $PSScriptRoot "..\scripts\main.py"
+
+$argsList = @("--project-path", $ProjectPath)
 if ($OutputPath) {
-    $cmd += " --output ""$OutputPath"""
+    $argsList += @("--output", $OutputPath)
 }
 
-Invoke-Expression $cmd
+Write-Host "[EXEC] & $python $scriptPath $argsList" -ForegroundColor Yellow
+& $python $scriptPath $argsList
 
 Write-Host ""
 Write-Host "[DONE] 示例调用完成。" -ForegroundColor Green

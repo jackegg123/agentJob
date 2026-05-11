@@ -26,8 +26,8 @@ input:
   output:
     type: string
     description: >
-      Path for the generated Excel report (default: ./java_code_scan_report.xlsx).
-      Excel 报告输出路径（默认 ./java_code_scan_report.xlsx）。
+      Path for the generated Excel report (default: project_dir/java-code-report.xlsx).
+      Excel 报告输出路径（默认在项目目录下生成 java-code-report.xlsx）。
     required: false
 
 steps:
