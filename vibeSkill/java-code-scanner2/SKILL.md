@@ -1,12 +1,12 @@
 ---
 name: java-code-scanner2
-version: 1.0.0
+version: 2.0.0
 description: >
   Scan Java projects for duplicate code and dead code (unused imports, fields,
   methods, and local variables). Detects redundant code via jscpd and unused
-  code via javalang AST parser, generating an Excel report with styled output.
-  扫描 Java 项目中的冗余代码和死代码（未使用的 import、字段、方法、局部变量）。
-  通过 jscpd 检测冗余代码，通过 javalang AST 解析器检测死代码，生成带样式的 Excel 报告。
+  code via javalang AST parser, generating both Markdown and Excel reports.
+  扫描 Java 项目中的冗余代码和无用代码（未使用的 import、字段、方法、局部变量）。
+  通过 jscpd 检测冗余代码，通过 javalang AST 解析器检测死代码，生成 Markdown + Excel 报告。
 
 tags:
   - java
@@ -20,15 +20,38 @@ input:
   project_path:
     type: string
     description: >
-      Absolute or relative path to the Java project root directory.
-      Java 项目根目录的绝对或相对路径。
+      Absolute or relative path to the Java source directory to scan.
+      If the path doesn't contain .java files directly, the agent should
+      recursively find subdirectories containing Java files and pass one to the script.
+      要扫描的 Java 源码目录的绝对或相对路径。
     required: true
   output:
     type: string
     description: >
-      Path for the generated Excel report (default: project_dir/java-code-report.xlsx).
-      Excel 报告输出路径（默认在项目目录下生成 java-code-report.xlsx）。
+      Output report path. `.md` suffix → Markdown, `.xlsx` suffix → Excel,
+      otherwise generates both. Default: project_dir/java-code-report.{md,xlsx}
+      报告输出路径。
     required: false
+  min_lines:
+    type: integer
+    description: "Minimum duplicate line count for jscpd (default: 3)"
+    required: false
+    default: 3
+  min_tokens:
+    type: integer
+    description: "Minimum duplicate token count for jscpd (default: 50)"
+    required: false
+    default: 50
+  skip_jscpd:
+    type: boolean
+    description: "Skip duplicate code scan"
+    required: false
+    default: false
+  skip_dead_code:
+    type: boolean
+    description: "Skip dead code scan"
+    required: false
+    default: false
 
 steps:
   - id: Init
@@ -58,103 +81,154 @@ steps:
       python scripts/main.py --help
       ```
 
+  - id: FindJavaDir
+    description: |
+      **🔍 Step 1: 找到正确的 Java 代码目录（智能体工作流）**
+
+      本脚本不再内置交互式目录选择。智能体负责在调用脚本前找到正确的目录。
+
+      ### 工作流
+
+      1. **检查用户提供的路径**是否直接包含 `.java` 文件
+         ```bash
+         find {{project_path}} -maxdepth 1 -name "*.java" | head -3
+         ```
+      2. 如果有 Java 文件 → 直接使用该路径作为 `--project-path`
+      3. 如果没有 → **递归查找**包含 Java 文件的子目录：
+         ```bash
+         find {{project_path}} -name "*.java" -not -path "*/test/*" -not -path "*/target/*" | head -20
+         ```
+      4. 分析找到的 Java 文件分布，**选择一个最合适的目录**传给脚本：
+         - 优先选择 `src/main/java` 目录
+         - 如果没有标准目录结构，选择 Java 文件数量最多的父目录
+         - 将选中的目录作为 `--project-path` 参数
+
+      ### 示例
+
+      用户说 "扫描 /home/user/my-java-project"：
+
+      ```
+      # 智能体执行
+      # 1. 检查根目录
+      find /home/user/my-java-project -maxdepth 1 -name "*.java"
+      # 结果: 空
+
+      # 2. 递归查找
+      find /home/user/my-java-project -name "*.java" -not -path "*/test/*" | head -5
+      # 输出:
+      # /home/user/my-java-project/module-a/src/main/java/com/example/Service.java
+      # /home/user/my-java-project/module-a/src/main/java/com/example/Controller.java
+      # /home/user/my-java-project/module-b/src/main/java/com/example/Dao.java
+
+      # 3. 智能体确定：最佳扫描目录是项目根目录（jscpd 会递归扫描子目录）
+      # → 使用 --project-path /home/user/my-java-project
+      ```
+
   - id: Run
     description: |
-      Execute the Java code scanner against the target project.
-      对目标项目执行 Java 代码扫描。
+      **🚀 Step 2: 运行扫描**
 
-      **⚠️ 重要：本工具为交互式使用，供 AI 智能体调用。执行过程中会打印目录列表并等待用户输入。**
+      使用在 Step 1 中找到的目录路径执行扫描。
 
-      ## 执行流程（智能体工作流）
-
-      ### 1. 运行命令
-
-      执行以下命令启动扫描：
-
-      **Linux / macOS:**
+      **基本用法:**
       ```bash
-      python3 scripts/main.py --project-path "{{project_path}}"
+      python3 scripts/main.py --project-path "{{java_source_dir}}"
       ```
 
-      **Windows:**
+      **指定输出路径:**
+      ```bash
+      # Markdown 报告
+      python3 scripts/main.py --project-path "{{java_source_dir}}" --output ./java-scan-report.md
+
+      # Excel 报告
+      python3 scripts/main.py --project-path "{{java_source_dir}}" --output ./java-scan-report.xlsx
+
+      # 同时生成两种（默认）
+      python3 scripts/main.py --project-path "{{java_source_dir}}" --output ./java-scan-report
+      ```
+
+      **自定义扫描参数:**
+      ```bash
+      # 更严格的参数
+      python3 scripts/main.py --project-path ./src --min-lines 5 --min-tokens 100
+
+      # 更宽松的参数
+      python3 scripts/main.py --project-path ./src --min-lines 2 --min-tokens 30
+      ```
+
+      **跳过特定扫描:**
+      ```bash
+      # 只扫描无用代码
+      python3 scripts/main.py --project-path ./src --skip-jscpd
+
+      # 只扫描重复代码
+      python3 scripts/main.py --project-path ./src --skip-dead-code
+      ```
+
+      **Windows (cmd):**
       ```cmd
-      python scripts\main.py --project-path "{{project_path}}"
+      python scripts\main.py --project-path C:\project\src --output report.md
       ```
 
-      **可选参数：**
-      - `--output /path/to/report.xlsx`：指定输出路径
+  - id: Report
+    description: |
+      **📊 Step 3: 阅读报告**
 
-      **跳过特定扫描：**
-      Linux/macOS: `SKIP_JSCPD=1 python3 scripts/main.py ...`
-      Windows: `set SKIP_JSCPD=1 && python scripts/main.py ...`
+      脚本会生成两种格式的报告：
 
-      ### 2. 解析脚本输出并生成选项（智能体 MUST DO）
+      ### Markdown 报告（推荐阅读）
 
-      脚本启动后会扫描项目结构，打印类似以下的输出：
+      包含：
+      - 📊 概览统计表（重复块数、总行数、问题数、扫描范围等）
+      - 🔴🟡🟢 严重程度分布
+      - 🔄 重复代码 Top 20（含文件路径、行号、重复行数、严重程度）
+      - 🗑️ 无用代码分类（未使用的 import/字段/方法/局部变量）
+      - 💡 重构建议
+
+      示例输出结构：
+      ```markdown
+      # Java 代码质量扫描报告
+
+      **项目**: my-project
+      **扫描时间**: 2026-05-12 14:30 CST
+      **扫描范围**: /path/to/src
+
+      ## 📊 概览统计
+      | 指标 | 数值 |
+      |------|------|
+      | 重复代码块数量 | 12 个 |
+      | 重复代码总行数 | 345 行 |
+      ...
+
+      ## 🔄 重复代码 Top 20
+      ### 1. 🔴 Service.java (行 45-78)
+      - **文件**: `com/example/Service.java`
+      - **重复行数**: 34 行
+      - **严重程度**: 高
+      - **详情**: 该代码块与文件 [AdminService.java] 第 52-85 行存在重复
+      ...
+
+      ## 🗑️ 无用代码
+      ### 类型分布
+      | 类型 | 数量 |
+      |------|------|
+      | 未使用的 import | 23 |
+      | 未使用的 private 字段 | 5 |
+      ...
+
+      ## 💡 重构建议
+      1. **优先处理 3 处高严重度重复代码**：建议提取公共基类或工具类
+      ...
       ```
-      发现 15 个包含 Java 文件的目录：
 
-        [1] module-a/src/main/java/com/example/a
-        [2] module-b/src/main/java/com/example/b
-        [3] module-b/src/main/java/com/example/b/sub
-        [4] module-c/src/main/java/com/example/c
-        ...
-      ```
+      ### Excel 报告（详细明细）
 
-      **⚠️ 你必须按以下步骤处理，保证交互体验统一：**
+      包含两个 Sheet：
+      - **冗余重复代码**：每条记录包含重要程度（高/中/低）、文件路径、行号、重复位置详情
+      - **无用代码**：每条记录包含重要程度、文件路径、行号、为什么无用
+      - 高/中重要程度行分别用红色/黄色背景突出显示
+      - 按重要程度从高到低排序
 
-      **Step A - 解析目录列表**
-
-      从脚本输出中提取所有 `[编号] 路径` 行，得到完整路径列表。
-
-      **Step B - 生成选项（最多 10 个）**
-
-      - 如果模块目录数量 ≤ 10，全部展示
-      - 如果模块目录数量 > 10，按深度排序（浅层优先），只展示前 9 个 +
-        一个 `[N] 扫描全部` 选项（即共 10 个选项）
-      - 每个选项展示完整的相对路径，并尝试提取模块名作简短说明
-      - 在最后追加一个「扫描全部」选项
-
-      **Step C - 向用户展示选项，请求多选**
-
-      必须用统一的选项格式展示给用户。示例格式：
-
-      ```
-      发现以下包含 Java 代码的模块目录，请选择要扫描哪些（支持多选）：
-
-      1. module-user/src/main/java/com/example/user（用户模块）
-      2. module-order/src/main/java/com/example/order（订单模块）
-      3. module-common/src/main/java/com/example/common（公共模块）
-      A. 扫描全部
-
-      请输入编号（支持多选如 1,3，直接回车或输入 A = 全部）：
-      ```
-
-      **Step D - 根据用户选择映射为路径输入**
-
-      用户选择编号后，你负责将编号映射为对应的完整路径，输入给脚本的提示行。
-
-      映射规则：
-      | 用户选择 | 你输入给脚本 |
-      |---|---|
-      | 选了编号 1,3 | 将选项 1 和 3 的路径用逗号连接输入 |
-      | 选了「全部」或直接回车 | 直接回车（不输入任何内容） |
-      | 用户没有明确回复 | 兜底：直接回车 = 扫描全部 |
-
-      **❌ 不要做的事：**
-      - 不要让用户自己输入路径字符串
-      - 不要只返回文字说明而不生成编号选项
-      - 不要把模块路径名称暴露给用户让用户手打
-      - 一定要生成数字编号选项，用户只要输入编号
-
-      ### 3. 兜底策略
-
-      - 如果用户说"全部扫描" → 直接回车
-      - 如果用户选择编号 → 你映射为路径字符串输入给脚本
-      - 如果用户没有明确选择 → 直接回车（扫描全部）
-
-      ### 4. 扫描完成
-
-      扫描完成后会在指定路径生成 Excel 报告（默认在项目根目录下 `java-code-report.xlsx`）。
-      报告包含两个 Sheet：冗余重复代码、无用代码。
-      每条记录都有「重要程度」列（高/中/低），按优先级从高到低排序。
+  - id: Cleanup
+    description: |
+      扫描完成后自动清理临时文件。报告文件保留在指定输出路径。

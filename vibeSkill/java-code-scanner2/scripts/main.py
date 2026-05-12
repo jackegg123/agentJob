@@ -6,13 +6,13 @@ Java Code Scanner v2 - 核心扫描引擎
 功能:
   1. 冗余重复代码扫描（基于 jscpd）
   2. 无用代码扫描（基于 javalang AST 解析器，检测未使用的 import/字段/方法/局部变量）
+  3. 生成 Excel 报告 + Markdown 报告
 
 用法:
-  python main.py --project-path /path/to/java/project [--output /path/to/report.xlsx]
-
-环境变量:
-  SKIP_JSCPD=1   跳过重复代码扫描
-  SKIP_JSCPD2=1  同上（兼容不同命名）
+  python main.py --project-path /path/to/java/code [--output report.md|xlsx]
+  python main.py --project-path /path --min-lines 5 --min-tokens 100
+  python main.py --project-path /path --skip-jscpd
+  python main.py --project-path /path --skip-dead-code
 """
 
 import argparse
@@ -23,13 +23,23 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import pandas as pd
-from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+# ── Excel 依赖（可选）──────────────────────────────────────────────
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
+
+try:
+    from openpyxl import load_workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
 
 
 # ====================================================================
@@ -39,6 +49,10 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 PRIORITY_HIGH = "高"
 PRIORITY_MEDIUM = "中"
 PRIORITY_LOW = "低"
+
+PRIORITY_ORDER = {PRIORITY_HIGH: 0, PRIORITY_MEDIUM: 1, PRIORITY_LOW: 2}
+
+CST = timezone(timedelta(hours=8))
 
 HEADER_DUPLICATE = [
     "重要程度", "项目相对路径", "文件名", "起始行", "结束行",
@@ -50,9 +64,6 @@ HEADER_DEAD_CODE = [
     "问题类型", "详细说明（为什么无用）",
 ]
 
-# 优先级排序权重（用于排序：高→中→低）
-PRIORITY_ORDER = {PRIORITY_HIGH: 0, PRIORITY_MEDIUM: 1, PRIORITY_LOW: 2}
-
 HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=11)
 HEADER_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
 HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -61,6 +72,18 @@ CELL_BORDER = Border(
     left=Side(style="thin"), right=Side(style="thin"),
     top=Side(style="thin"), bottom=Side(style="thin"),
 )
+
+# 高/中/低行颜色
+PRIORITY_FILLS = {
+    PRIORITY_HIGH: PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid"),
+    PRIORITY_MEDIUM: PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid"),
+    PRIORITY_LOW: None,
+}
+
+# 文件发现配置
+JAVA_PATTERN = "**/*.java"
+EXCLUDE_DIRS = {".git", "node_modules", "target", "build", "out", ".idea", ".vscode", "__pycache__",
+                ".jscpd-report", "jscpd-report", "dist", "classes"}
 
 
 # ====================================================================
@@ -83,293 +106,111 @@ def skip(msg: str) -> None:
     print(f"  [SKIP] {msg}")
 
 
-def resolve_project_path(project_path: str) -> Path:
-    """规范化并验证项目路径。"""
-    path = Path(project_path).resolve()
-    if not path.exists():
-        raise FileNotFoundError(f"项目路径不存在: {project_path}")
-    if not path.is_dir():
-        raise NotADirectoryError(f"项目路径不是目录: {project_path}")
-    return path
+def resolve_path(path_str: str) -> Path:
+    """规范化并验证路径。"""
+    p = Path(path_str).resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"路径不存在: {path_str}")
+    if not p.is_dir():
+        raise NotADirectoryError(f"路径不是目录: {path_str}")
+    return p
 
 
 def rel_path(project_root: Path, abs_path: str) -> str:
-    """获取文件相对路径。"""
+    """获取文件相对于 project_root 的相对路径。"""
     try:
         return str(Path(abs_path).resolve().relative_to(project_root))
-    except (ValueError, RuntimeError):
+    except (ValueError, OSError):
         return Path(abs_path).name
 
 
-def run_cmd(cmd: List[str], cwd: Optional[str] = None, timeout: int = 1800) -> subprocess.CompletedProcess:
-    """安全执行外部命令。"""
-    print(f"  [EXEC] {' '.join(cmd)}")
-    try:
-        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-        if result.returncode != 0:
-            warn(f"退出码 {result.returncode}")
-            if result.stderr:
-                debug_stderr(result.stderr)
-        return result
-    except subprocess.TimeoutExpired:
-        err(f"命令超时 ({timeout}s)")
-        raise
-    except FileNotFoundError:
-        err(f"命令未找到: {cmd[0]}")
-        raise
-    except Exception as e:
-        err(f"执行异常: {e}")
-        raise
+def find_java_dirs(project_root: Path) -> List[str]:
+    """
+    在目录树中递归寻找所有包含 .java 文件的子目录。
+    如果 project_root 本身有 .java 文件，返回 ['.']。
+    """
+    java_subdirs: Set[str] = set()
+    root_has_java = False
 
+    for dirpath, dirnames, filenames in os.walk(str(project_root)):
+        # 跳过排除目录
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
 
-def debug_stderr(text: str) -> None:
-    """截断打印 stderr。"""
-    lines = text.strip().split("\n")
-    for line in lines[:5]:
-        print(f"       | {line}")
-    if len(lines) > 5:
-        print(f"       | ... (共 {len(lines)} 行)")
+        has_java = any(f.endswith(".java") for f in filenames)
+        if has_java:
+            if dirpath == str(project_root):
+                root_has_java = True
+            else:
+                rel = rel_path(project_root, dirpath)
+                if rel and rel != ".":
+                    java_subdirs.add(rel)
+
+    if root_has_java:
+        return ["."]
+
+    return sorted(java_subdirs)
 
 
 # ====================================================================
-# 模块 0: 环境检查
+# 环境检查
 # ====================================================================
 
 def check_environment() -> Dict[str, bool]:
-    """
-    检查所有运行依赖。
-    缺失时不中断，只做记录，调用方根据状态决定是否跳过对应模块。
-    """
+    """检查所有运行依赖，缺失时只做记录。"""
     print("\n" + "=" * 60)
     info("环境依赖检查")
     print("=" * 60)
 
     status: Dict[str, bool] = {}
 
-    # Python 版本
+    # Python
     ver = sys.version_info
     py_ok = ver.major >= 3 and ver.minor >= 9
     ok(f"Python {ver.major}.{ver.minor}.{ver.micro}") if py_ok else err("需要 Python >= 3.9")
     status["python"] = py_ok
 
-    # Node.js
-    node_ok = shutil.which("node") is not None
-    if node_ok:
-        try:
-            r = subprocess.run(["node", "--version"], capture_output=True, text=True, timeout=5)
-            ok(f"Node.js {r.stdout.strip()}")
-        except Exception:
-            ok("Node.js 已安装")
-    else:
-        warn("Node.js 未安装 (jscpd 需要)")
-    status["node"] = node_ok
-
-    # jscpd
-    jscpd_ok = shutil.which("jscpd") is not None
-    if jscpd_ok:
-        ok("jscpd 已安装")
-    elif shutil.which("npx"):
-        ok("jscpd 将通过 npx 调用")
-        jscpd_ok = True
+    # jscpd (直接使用 shutil.which)
+    jscpd_bin = shutil.which("jscpd")
+    if jscpd_bin:
+        ok(f"jscpd ({jscpd_bin})")
+        status["jscpd"] = True
     else:
         warn("jscpd 未安装 (将跳过冗余代码扫描)")
-    status["jscpd"] = jscpd_ok
+        status["jscpd"] = False
 
     # javalang
-    jl_ok = False
     try:
-        import javalang  # noqa
-        jl_ok = True
+        import javalang  # noqa: F401
         ok("javalang 已安装")
+        status["javalang"] = True
     except ImportError:
         warn("javalang 未安装 (将跳过无用代码扫描)")
-    status["javalang"] = jl_ok
+        status["javalang"] = False
 
     # pandas + openpyxl
-    pd_ok = False
-    try:
-        import pandas  # noqa
-        pd_ok = True
+    if HAS_PANDAS:
         ok("pandas 已安装")
-    except ImportError:
-        warn("pandas 未安装 (无法生成 Excel)")
+    else:
+        warn("pandas 未安装 (将跳过 Excel 报告)")
 
-    xl_ok = False
-    try:
-        import openpyxl  # noqa
-        xl_ok = True
+    if HAS_OPENPYXL:
         ok("openpyxl 已安装")
-    except ImportError:
-        warn("openpyxl 未安装 (无法生成 Excel)")
-
-    if not pd_ok or not xl_ok:
-        warn("请运行: pip install -r requirements.txt")
+    else:
+        warn("openpyxl 未安装 (将跳过 Excel 报告)")
 
     print()
     return status
 
 
-def scan_project_structure(project_root: Path) -> List[str]:
-    """
-    扫描项目目录结构，列出所有包含 .java 文件的子目录（相对路径）。
-    用于让用户选择要扫描的模块/子目录。
-    """
-    print("\n" + "=" * 60)
-    info("扫描项目目录结构...")
-    print("=" * 60)
-
-    java_dirs: Set[str] = set()
-    for root, _, files in os.walk(str(project_root)):
-        has_java = any(f.endswith(".java") for f in files)
-        if has_java:
-            rel = rel_path(project_root, root)
-            if rel:
-                java_dirs.add(rel)
-
-    sorted_dirs = sorted(java_dirs)
-
-    print(f"\n  发现 {len(sorted_dirs)} 个包含 Java 文件的目录：\n")
-    for i, d in enumerate(sorted_dirs, 1):
-        print(f"    [{i}] {d}")
-
-    # 自动检测 Maven/Gradle 模块
-    pom_files = list(project_root.rglob("pom.xml"))
-    gradle_files = list(project_root.rglob("build.gradle")) + list(project_root.rglob("build.gradle.kts"))
-    if pom_files:
-        print(f"\n  检测到 Maven 项目（{len(pom_files)} 个 pom.xml）")
-    if gradle_files:
-        print(f"\n  检测到 Gradle 项目（{len(gradle_files)} 个构建文件）")
-
-    print(f"\n  输入编号选择要扫描的目录，或输入 0 扫描整个项目根目录：")
-    return sorted_dirs
-
-
-def resolve_paths_from_input(project_root: Path, input_str: str) -> List[Path]:
-    """
-    解析用户输入的路径表达式，返回对应的绝对路径列表。
-
-    支持：
-    - 绝对路径：`/home/user/project/module-a`
-    - 相对路径（相对于 project_root）：`module-a`、`src/main`
-    - 逗号分隔多个路径：`module-a,module-b`
-    - 空格分隔多个路径：`module-a module-b`（自动按空格/逗号分割）
-    - 空输入：扫描全部模块（兜底）
-
-    自动过滤掉不存在或不包含 Java 文件的目录，并给出警告。
-    """
-    raw = input_str.strip()
-
-    # 空输入 → 全部模块
-    if not raw:
-        return []
-
-    # 分割：逗号和连续空格都作为分隔符
-    parts = [p.strip() for p in re.split(r"[,\s]+|，", raw) if p.strip()]
-
-    resolved: List[Path] = []
-    for part in parts:
-        # 尝试作为绝对路径
-        p = Path(part)
-        if p.is_absolute():
-            candidate = p.resolve()
-        else:
-            # 尝试作为相对路径（相对于 project_root）
-            candidate = (project_root / part).resolve()
-
-        if not candidate.exists():
-            warn(f"路径不存在，已跳过: {part}")
-            continue
-        if not candidate.is_dir():
-            warn(f"路径不是目录，已跳过: {part}")
-            continue
-
-        # 检查是否有 Java 文件
-        has_java = any(f.endswith(".java") for f in os.listdir(str(candidate)))
-        if not has_java:
-            has_java = any(
-                f.endswith(".java")
-                for root, _, files in os.walk(str(candidate))
-                for f in files
-            )
-        if not has_java:
-            warn(f"路径中未找到 Java 文件，已跳过: {part}")
-            continue
-
-        resolved.append(candidate)
-
-    # 去重（按绝对路径）
-    seen: Set[str] = set()
-    unique: List[Path] = []
-    for p in resolved:
-        s = str(p)
-        if s not in seen:
-            seen.add(s)
-            unique.append(p)
-
-    return unique
-
-
-def select_scan_target(project_root: Path) -> List[Path]:
-    """
-    选择扫描目标路径。
-    返回一个路径列表（可能包含多个模块）。
-
-    行为：
-    - 如果项目根目录包含 Java 文件，直接返回 [根目录]
-    - 否则列出子模块目录，提示输入路径：
-      - 用户/智能体可以输入模块的绝对路径或相对路径
-      - 支持逗号或空格分隔多个路径
-      - **直接回车（不输入）→ 扫描所有模块（兜底逻辑）**
-    """
-    # 检查根目录是否包含 Java 文件
-    root_has_java = False
-    for f in os.listdir(str(project_root)):
-        if f.endswith(".java"):
-            root_has_java = True
-            break
-    if not root_has_java:
-        for root, _, files in os.walk(str(project_root)):
-            depth = root[len(str(project_root)) + 1:].count(os.sep)
-            if depth == 0 and any(f.endswith(".java") for f in files):
-                root_has_java = True
-                break
-
-    if root_has_java:
-        info("项目根目录包含 Java 文件，直接扫描根目录")
-        return [project_root]
-
-    # 列出子模块让用户/智能体选择
-    dirs = scan_project_structure(project_root)
-
-    if not dirs:
-        warn("项目中未找到任何 Java 文件")
-        return [project_root]
-
-    hint = (
-        "\n  请输入要扫描的目录路径（支持: 绝对路径 / 相对路径 / 逗号或空格分隔多个 / 直接回车=全部）:\n"
-        "  > "
-    )
-    choice = input(hint).strip()
-
-    selected = resolve_paths_from_input(project_root, choice)
-
-    if not selected:
-        # 没有有效输入或路径全部无效 → 扫描所有
-        info("未指定有效路径，扫描所有模块")
-        return [project_root / d for d in dirs]
-
-    names = [str(p.relative_to(project_root)) if project_root in p.parents else str(p) for p in selected]
-    info(f"将扫描 {len(selected)} 个目录: {names}")
-    return selected
-
-
 # ====================================================================
-# 模块 1: 冗余代码扫描 (jscpd)
+# 冗余重复代码扫描 (jscpd)
 # ====================================================================
 
 def _get_start_line(file_info: Dict[str, Any]) -> int:
-    """从 jscpd 的 firstFile/secondFile 中提取起始行号。
-    兼容 jscpd 3.x (字段在顶层为整数) 和 4.x (字段在 startLoc.line)。"""
+    """
+    从 jscpd report 的 file info 中提取起始行号。
+    兼容 jscpd 3.x / 4.x 以及直接整数或嵌套对象格式。
+    """
     val = file_info.get("start", 0)
     if isinstance(val, int) and val > 0:
         return val
@@ -379,7 +220,7 @@ def _get_start_line(file_info: Dict[str, Any]) -> int:
 
 
 def _get_end_line(file_info: Dict[str, Any]) -> int:
-    """从 jscpd 的 firstFile/secondFile 中提取结束行号。"""
+    """提取结束行号，兼容多种 jscpd 版本。"""
     val = file_info.get("end", 0)
     if isinstance(val, int) and val > 0:
         return val
@@ -388,157 +229,157 @@ def _get_end_line(file_info: Dict[str, Any]) -> int:
     return file_info.get("endLoc", {}).get("line", 0)
 
 
-def scan_duplicate(scan_targets: List[Path], temp_dir: str, project_root: Path) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def _find_jscpd_report(report_dir: str) -> Optional[str]:
     """
-    执行 jscpd 扫描并解析 JSON 报告。
-    支持同时对多个目录扫描，实现跨模块重复代码检测。
+    在 report_dir 中查找 jscpd 生成的 JSON 报告文件。
+    排除用作 jscpd 配置的 .jscpd.json 文件。
+    """
+    for dirpath, _, filenames in os.walk(report_dir):
+        for f in sorted(filenames):
+            full = os.path.join(dirpath, f)
+            basename = os.path.basename(full)
+            if not f.endswith(".json"):
+                continue
+            # 跳过我们自己写的配置文件 (jscpd 默认读 .jscpd.json 作为配置)
+            if basename == ".jscpd.json":
+                continue
+            if "jscpd" in basename.lower():
+                return full
+    # fallback: 找任意 json
+    for dirpath, _, filenames in os.walk(report_dir):
+        for f in sorted(filenames):
+            full = os.path.join(dirpath, f)
+            if f.endswith(".json") and os.path.basename(full) != ".jscpd.json":
+                return full
+    return None
 
-    当目标准备过多时（>3 个），使用 .jscpd.json 配置文件避免命令行超长。
+
+def scan_duplicate(
+    scan_target: Path,
+    temp_dir: str,
+    project_root: Path,
+    min_lines: int = 3,
+    min_tokens: int = 50,
+) -> Tuple[List[Dict[str, Any]], List[str], int, int]:
+    """
+    使用 jscpd 扫描 Java 文件的重复代码。
 
     Args:
-        scan_targets: 要扫描的目标目录列表（可能是多个子模块）。
-        temp_dir: 临时目录，用于存放 jscpd 输出。
-        project_root: 项目根目录，用于计算相对路径。
+        scan_target: 扫描目标目录
+        temp_dir: 临时目录用于存放 jscpd 输出
+        project_root: 项目根目录
+        min_lines: 最小重复行数
+        min_tokens: 最小 token 数
 
     Returns:
-        (结果列表, 错误信息)。错误信息为 None 表示扫描正常完成。
+        (结果列表, 错误列表, 总文件数, 总重复块数)
     """
     print("\n" + "=" * 60)
     info("冗余重复代码扫描 - jscpd")
     print("=" * 60)
 
     results: List[Dict[str, Any]] = []
-    error_msg: Optional[str] = None
-
-    # 统计所有扫描目标的 Java 文件数
-    total_java = 0
-    valid_targets = []
-    for t in scan_targets:
-        java_count = 0
-        for root, _, files in os.walk(str(t)):
-            java_count += sum(1 for f in files if f.endswith(".java"))
-        if java_count > 0:
-            total_java += java_count
-            valid_targets.append(t)
-        else:
-            warn(f"目标目录中没有 Java 文件，已跳过: {t}")
-
-    if not valid_targets:
-        err_msg = f"所有目标目录中都没有找到任何 Java 文件"
-        err(err_msg)
-        return results, err_msg
-
-    info(f"共 {len(valid_targets)} 个目录，包含 {total_java} 个 Java 文件")
+    errors: List[str] = []
+    total_files = 0
+    total_clones = 0
 
     jscpd_bin = shutil.which("jscpd")
-    if jscpd_bin:
-        jscpd_cmd = [jscpd_bin]
-    else:
-        jscpd_cmd = ["npx", "jscpd"]
+    if not jscpd_bin:
+        return results, ["jscpd 未安装"], 0, 0
 
-    # 目标太多时用配置文件，避免命令行参数超长
-    if len(valid_targets) > 3:
-        info(f"扫描目标较多 ({len(valid_targets)} 个)，使用配置文件传递路径")
-        config = {
-            "path": [str(t) for t in valid_targets],
-            "pattern": "**/*.java",
-            "reporters": ["json"],
-            "output": temp_dir,
-            "threshold": 0,
-            "minLines": 3,
-            "minTokens": 10,
-        }
-        config_path = os.path.join(temp_dir, ".jscpd.json")
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
-        cmd = jscpd_cmd + ["--config", config_path]
+    info(f"jscpd: {jscpd_bin}")
+    info(f"扫描目标: {scan_target}")
+    info(f"参数: min-lines={min_lines}, min-tokens={min_tokens}")
 
-        try:
-            result = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True, timeout=600)
-        except subprocess.TimeoutExpired:
-            err_msg = "jscpd 扫描超时（超过 600 秒）"
-            err(err_msg)
-            return results, err_msg
-    else:
-        target_args = [str(t) for t in valid_targets]
-        cmd = jscpd_cmd + target_args + [
-            "--pattern", "**/*.java",
-            "--reporters", "json",
-            "--output", temp_dir,
-            "--threshold", "0",
-            "--min-lines", "3",
-            "--min-tokens", "10",
-        ]
+    # 使用显式配置文件传递参数，避免同名文件冲突
+    # 关键：配置文件命名为 scanner-config.json（不是 .jscpd.json）
+    config_path = os.path.join(temp_dir, "scanner-config.json")
+    config: Dict[str, Any] = {
+        "path": [str(scan_target)],
+        "pattern": JAVA_PATTERN,
+        "reporters": ["json"],
+        "output": temp_dir,
+        "threshold": 0,
+        "minLines": min_lines,
+        "minTokens": min_tokens,
+        "silent": True,
+    }
 
-        try:
-            result = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True, timeout=600)
-        except subprocess.TimeoutExpired:
-            err_msg = "jscpd 扫描超时（超过 600 秒）"
-            err(err_msg)
-            return results, err_msg
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
 
-    stderr_text = result.stderr.strip() if result.stderr else ""
-    stdout_text = result.stdout.strip() if result.stdout else ""
+    cmd = [jscpd_bin, "--config", config_path]
 
-    # jscpd 发现重复且超过 threshold=0% 时可能会非零退出，
-    # 但只要生成了报告就继续解析，不完全依赖 exit code
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        errors.append("jscpd 扫描超时（超过 600 秒）")
+        return results, errors, 0, 0
+
+    stderr_text = (result.stderr or "").strip()
+    stdout_text = (result.stdout or "").strip()
+
+    # 打印 jscpd 摘要输出
+    if stdout_text:
+        for line in stdout_text.split("\n")[:10]:
+            if line.strip():
+                print(f"       | {line.strip()}")
+
+    # jscpd 发现重复后可能非零退出，先尝试找报告
     if result.returncode != 0:
         if "Too many duplicates" in stderr_text or "over threshold" in stderr_text:
-            warn("jscpd 检测到重复超过阈值，但仍会生成报告，继续解析...")
+            warn("jscpd 检测到重复超过阈值，继续解析报告")
         elif "No files found" in stderr_text or "no files" in stderr_text.lower():
-            err_msg = f"jscpd 未找到匹配的 Java 文件（退出码 {result.returncode}）: {stderr_text[:300]}"
-            err(err_msg)
-            return results, err_msg
+            errors.append(f"jscpd 未找到匹配的 Java 文件: {stderr_text[:300]}")
+            return results, errors, 0, 0
         else:
-            # 非致命错误，先尝试找报告
-            warn(f"jscpd 异常退出（退出码 {result.returncode}）：检查是否生成了报告")
+            warn(f"jscpd 退出码 {result.returncode}，尝试解析报告")
 
-    # 查找生成的 JSON 报告（排除配置文件 .jscpd.json）
-    report_path: Optional[str] = None
-    for root, _, files in os.walk(temp_dir):
-        for f in files:
-            if f.endswith(".json") and "jscpd" in f.lower() and f != ".jscpd.json":
-                report_path = os.path.join(root, f)
-                break
-        if report_path:
-            break
+    # 查找报告文件
+    report_path = _find_jscpd_report(temp_dir)
 
     if not report_path:
-        for root, _, files in os.walk(temp_dir):
-            for f in files:
-                if f.endswith(".json") and not f.startswith("."):
-                    report_path = os.path.join(root, f)
-                    break
-            if report_path:
-                break
+        info("jscpd 未生成报告，未发现重复代码")
+        return results, errors, 0, 0
 
-    if not report_path:
-        info("jscpd 未生成报告，未发现重复代码。")
-        return results, None
+    info(f"解析报告: {os.path.basename(report_path)}")
 
-    info(f"解析报告: {report_path}")
-    with open(report_path, "r", encoding="utf-8") as f:
-        try:
+    try:
+        with open(report_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        except json.JSONDecodeError as je:
-            err_msg = f"jscpd 报告 JSON 解析失败: {je}"
-            err(err_msg)
-            return results, err_msg
+    except (json.JSONDecodeError, OSError) as je:
+        errors.append(f"jscpd 报告 JSON 解析失败: {je}")
+        return results, errors, 0, 0
+
+    # 提取统计信息
+    stats = data.get("statistics", {})
+    total_stats = stats.get("total", {})
+    total_files = total_stats.get("sources", 0)
+    total_clones = total_stats.get("clones", 0)
 
     duplicates = data.get("duplicates", [])
     if not duplicates:
-        info("jscpd 报告中未发现重复代码")
-        return results, None
+        info(f"未发现重复代码 (扫描 {total_files} 个文件)")
+        return results, errors, total_files, total_clones
 
-    info(f"发现 {len(duplicates)} 处重复")
+    info(f"发现 {len(duplicates)} 处重复 (扫描 {total_files} 个文件)")
 
     for dup in duplicates:
         try:
+            # jscpd 4.x 使用 firstFile/secondFile
             first = dup.get("firstFile", {})
             second = dup.get("secondFile", {})
 
             f_file = first.get("name", "") or first.get("path", "")
-            if not f_file:
+            s_file = second.get("name", "") or second.get("path", "")
+
+            if not f_file or not s_file:
                 continue
 
             f_start = _get_start_line(first)
@@ -546,18 +387,12 @@ def scan_duplicate(scan_targets: List[Path], temp_dir: str, project_root: Path) 
             s_start = _get_start_line(second)
             s_end = _get_end_line(second)
 
-            s_file = second.get("name", "") or second.get("path", "")
-            if not s_file:
-                continue
-
+            f_filename = os.path.basename(f_file)
             s_filename = os.path.basename(s_file)
-            desc = (
-                f"该代码块与文件 [{s_filename}] 第 {s_start}-{s_end} 行存在重复"
-                f" (文件: {rel_path(project_root, s_file)})"
-            )
 
             dup_lines = f_end - f_start + 1
-            is_cross_file = os.path.basename(f_file) != os.path.basename(s_file)
+            is_cross_file = f_filename != s_filename
+
             if dup_lines >= 10 and is_cross_file:
                 priority = PRIORITY_HIGH
             elif dup_lines >= 6:
@@ -565,40 +400,41 @@ def scan_duplicate(scan_targets: List[Path], temp_dir: str, project_root: Path) 
             else:
                 priority = PRIORITY_LOW
 
+            desc = (
+                f"该代码块与文件 [{s_filename}] 第 {s_start}-{s_end} 行存在重复"
+                f" (文件: {rel_path(project_root, s_file)})"
+            )
+
             results.append({
                 "priority": priority,
                 "relative_path": rel_path(project_root, f_file),
-                "filename": os.path.basename(f_file),
+                "filename": f_filename,
                 "start_line": f_start,
                 "end_line": f_end,
                 "issue_type": "冗余重复代码",
                 "description": desc,
             })
         except Exception as e:
-            warn(f"解析 duplicate 记录时异常: {e}")
+            warn(f"解析 duplicate 记录异常: {e}")
             continue
 
-    return results, None
+    return results, errors, total_files, total_clones
 
 
 # ====================================================================
-# 模块 2: 无用代码扫描 (javalang AST)
+# 无用代码扫描 (javalang AST)
 # ====================================================================
 
-def scan_dead_code(scan_target: Path, project_root: Path) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def scan_dead_code(
+    scan_target: Path,
+    project_root: Path,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
-    使用 javalang 解析 Java 文件的 AST，检测以下无用代码：
-      1. 未使用的 import
-      2. 未使用的 private 字段
-      3. 未使用的 private 方法
-      4. 未使用的局部变量
-
-    Args:
-        scan_target: 要扫描的目标目录（可能是子模块）。
-        project_root: 项目根目录，用于计算相对路径。
-
-    Returns:
-        格式化后的扫描结果列表。
+    使用 javalang 解析 Java 文件 AST，检测无用代码：
+    - 未使用的 import
+    - 未使用的 private 字段
+    - 未使用的 private 方法
+    - 未使用的局部变量
     """
     print("\n" + "=" * 60)
     info("无用代码扫描 - javalang AST")
@@ -607,26 +443,28 @@ def scan_dead_code(scan_target: Path, project_root: Path) -> Tuple[List[Dict[str
     import javalang
 
     results: List[Dict[str, Any]] = []
+    errors: List[str] = []
 
     # 收集所有 Java 文件
     java_files: List[Path] = []
-    for root, _, files in os.walk(str(scan_target)):
-        for f in files:
+    for dirpath, dirnames, filenames in os.walk(str(scan_target)):
+        dirnames[:] = [d for d in dirnames if d not in EXCLUDE_DIRS]
+        for f in filenames:
             if f.endswith(".java"):
-                java_files.append(Path(root) / f)
+                java_files.append(Path(dirpath) / f)
 
     info(f"找到 {len(java_files)} 个 Java 文件，开始分析...")
     parsed_count = 0
     skipped_count = 0
 
     for jf in java_files:
-        # 大文件处理策略
         try:
             file_size = jf.stat().st_size
         except OSError:
             skipped_count += 1
             continue
 
+        # 大文件回退正则检测
         if file_size > 1024 * 1024:
             warn(f"文件过大，回退正则检测: {rel_path(project_root, str(jf))}")
             try:
@@ -637,7 +475,6 @@ def scan_dead_code(scan_target: Path, project_root: Path) -> Tuple[List[Dict[str
             skipped_count += 1
             continue
 
-        # 读取源码
         try:
             with open(jf, "r", encoding="utf-8", errors="replace") as fh:
                 source = fh.read()
@@ -646,11 +483,10 @@ def scan_dead_code(scan_target: Path, project_root: Path) -> Tuple[List[Dict[str
             skipped_count += 1
             continue
 
-        # 用 javalang 解析 AST
         try:
             tree = javalang.parse.parse(source)
         except javalang.parser.JavaSyntaxError as e:
-            at_line = getattr(e.at, 'line', '?') if hasattr(e, 'at') else '?'
+            at_line = getattr(e.at, "line", "?") if hasattr(e, "at") else "?"
             warn(f"语法错误，跳过: {rel_path(project_root, str(jf))} at line {at_line}")
             skipped_count += 1
             continue
@@ -664,35 +500,29 @@ def scan_dead_code(scan_target: Path, project_root: Path) -> Tuple[List[Dict[str
         filename = jf.name
         source_lines = source.split("\n")
 
-        # 用 try-except 包裹每个文件的完整分析，防止异常中断整个扫描
         try:
             _analyze_file(tree, source_lines, relative, filename, results)
         except Exception as e:
             warn(f"文件分析异常 ({relative}): {e}")
             skipped_count += 1
-            continue
 
-        # 进度提示
-        if parsed_count % 50 == 0:
+        if parsed_count % 100 == 0:
             info(f"已分析 {parsed_count}/{len(java_files)} 个文件...")
 
-    info(f"分析完成: 成功解析 {parsed_count} 个, 跳过 {skipped_count} 个")
+    if errors:
+        for e in errors:
+            err(e)
+
+    info(f"分析完成: 成功 {parsed_count} 个, 跳过 {skipped_count} 个")
     info(f"发现 {len(results)} 处死代码问题")
-    return results, None
+    return results, errors
 
 
-# ====================================================================
-# 模块 2 子函数: 单文件分析
-# ====================================================================
+# ── 单文件 AST 分析 ────────────────────────────────────────────────
 
-def _analyze_file(
-    tree: Any, source_lines: List[str],
-    relative: str, filename: str, results: List[Dict[str, Any]]
-) -> None:
-    """
-    对单个 Java 文件执行 4 种无用代码检测。
-    每种检测独立 try-except，防止单步异常丢弃全部结果。
-    """
+def _analyze_file(tree: Any, source_lines: List[str], relative: str,
+                  filename: str, results: List[Dict[str, Any]]) -> None:
+    """对单个 Java 文件执行 4 种无用代码检测。"""
     try:
         _detect_unused_imports(tree, source_lines, relative, filename, results)
     except Exception as e:
@@ -714,10 +544,9 @@ def _analyze_file(
         warn(f"  局部变量检测异常 ({filename}): {e}")
 
 
-def _detect_unused_imports(
-    tree: Any, source_lines: List[str],
-    relative: str, filename: str, results: List[Dict[str, Any]]
-) -> None:
+def _detect_unused_imports(tree: Any, source_lines: List[str],
+                           relative: str, filename: str,
+                           results: List[Dict[str, Any]]) -> None:
     """检测未使用的 import 语句。"""
     for imp in tree.imports:
         if not imp.path:
@@ -733,36 +562,37 @@ def _detect_unused_imports(
             else:
                 used = any(
                     not line.strip().startswith("import")
-                    and re.search(r'\b' + re.escape(short_name) + r'\b', line)
+                    and re.search(r"\b" + re.escape(short_name) + r"\b", line)
                     for line in source_lines
                 )
-            if not used:
-                results.append({
-                    "priority": PRIORITY_LOW,
-                    "relative_path": relative, "filename": filename,
-                    "start_line": (imp.position.line if imp.position else 1),
-                    "end_line": (imp.position.line if imp.position else 1),
-                    "issue_type": "未使用的 import",
-                    "description": f"import '{imp.path}' 在文件中未被使用",
-                })
         except re.error:
             continue
         except Exception:
             continue
 
+        if not used:
+            results.append({
+                "priority": PRIORITY_LOW,
+                "relative_path": relative,
+                "filename": filename,
+                "start_line": (imp.position.line if imp.position else 1),
+                "end_line": (imp.position.line if imp.position else 1),
+                "issue_type": "未使用的 import",
+                "description": f"import '{imp.path}' 在文件中未被使用",
+            })
 
-def _detect_unused_fields(
-    tree: Any, source_lines: List[str],
-    relative: str, filename: str, results: List[Dict[str, Any]]
-) -> None:
+
+def _detect_unused_fields(tree: Any, source_lines: List[str],
+                          relative: str, filename: str,
+                          results: List[Dict[str, Any]]) -> None:
     """检测未使用的 private 字段。"""
     from javalang.tree import FieldDeclaration
 
-    private_fields = []
-    injection_fields = set()
+    private_fields: List[Tuple[Any, str]] = []
+    injection_fields: Set[str] = set()
     injection_keywords = {"Autowired", "Inject", "Resource", "Value"}
 
-    for path, node in tree:
+    for _path, node in tree:
         try:
             if not isinstance(node, FieldDeclaration):
                 continue
@@ -770,7 +600,7 @@ def _detect_unused_fields(
             if "private" not in modifiers:
                 continue
 
-            annotations = set()
+            annotations: Set[str] = set()
             if hasattr(node, "annotations") and node.annotations:
                 for ann in node.annotations:
                     if hasattr(ann, "name"):
@@ -786,13 +616,13 @@ def _detect_unused_fields(
         except Exception:
             continue
 
-    used_fields = set()
+    used_fields: Set[str] = set()
     for line_num, line in enumerate(source_lines, 1):
         for fnode, fn in private_fields:
             if fn in used_fields:
                 continue
             try:
-                if not re.search(r'\b' + re.escape(fn) + r'\b', line):
+                if not re.search(r"\b" + re.escape(fn) + r"\b", line):
                     continue
             except re.error:
                 continue
@@ -804,7 +634,8 @@ def _detect_unused_fields(
         if fn not in used_fields:
             results.append({
                 "priority": PRIORITY_MEDIUM,
-                "relative_path": relative, "filename": filename,
+                "relative_path": relative,
+                "filename": filename,
                 "start_line": (fnode.position.line if fnode.position else 1),
                 "end_line": (fnode.position.line if fnode.position else 1),
                 "issue_type": "未使用的 private 字段",
@@ -812,15 +643,14 @@ def _detect_unused_fields(
             })
 
 
-def _detect_unused_methods(
-    tree: Any, source_lines: List[str],
-    relative: str, filename: str, results: List[Dict[str, Any]]
-) -> None:
+def _detect_unused_methods(tree: Any, source_lines: List[str],
+                           relative: str, filename: str,
+                           results: List[Dict[str, Any]]) -> None:
     """检测未使用的 private 方法。"""
     from javalang.tree import MethodDeclaration
 
-    private_methods = []
-    for path, node in tree:
+    private_methods: List[Tuple[Any, str]] = []
+    for _path, node in tree:
         try:
             if not isinstance(node, MethodDeclaration):
                 continue
@@ -833,13 +663,13 @@ def _detect_unused_methods(
         except Exception:
             continue
 
-    used_methods = set()
+    used_methods: Set[str] = set()
     for line_num, line in enumerate(source_lines, 1):
         for mnode, mn in private_methods:
             if mn in used_methods:
                 continue
             try:
-                if not re.search(r'\b' + re.escape(mn) + r'\s*\(', line):
+                if not re.search(r"\b" + re.escape(mn) + r"\s*\(", line):
                     continue
             except re.error:
                 continue
@@ -851,7 +681,8 @@ def _detect_unused_methods(
         if mn not in used_methods:
             results.append({
                 "priority": PRIORITY_MEDIUM,
-                "relative_path": relative, "filename": filename,
+                "relative_path": relative,
+                "filename": filename,
                 "start_line": (mnode.position.line if mnode.position else 1),
                 "end_line": (mnode.position.line if mnode.position else 1),
                 "issue_type": "未使用的 private 方法",
@@ -859,15 +690,14 @@ def _detect_unused_methods(
             })
 
 
-def _detect_unused_locals(
-    tree: Any, source_lines: List[str],
-    relative: str, filename: str, results: List[Dict[str, Any]]
-) -> None:
-    """检测未使用的局部变量（声明后只有赋值没有读取）。"""
+def _detect_unused_locals(tree: Any, source_lines: List[str],
+                          relative: str, filename: str,
+                          results: List[Dict[str, Any]]) -> None:
+    """检测未使用的局部变量。"""
     from javalang.tree import LocalVariableDeclaration
 
-    local_vars = []
-    for path, node in tree:
+    local_vars: List[Tuple[str, int]] = []
+    for _path, node in tree:
         try:
             if not isinstance(node, LocalVariableDeclaration):
                 continue
@@ -877,7 +707,7 @@ def _detect_unused_locals(
         except Exception:
             continue
 
-    used_locals = set()
+    used_locals: Set[str] = set()
     for line_num, line in enumerate(source_lines, 1):
         for lv_name, decl_line in local_vars:
             if lv_name in used_locals:
@@ -885,14 +715,13 @@ def _detect_unused_locals(
             if line_num <= decl_line:
                 continue
             try:
-                if not re.search(r'\b' + re.escape(lv_name) + r'\b', line):
+                if not re.search(r"\b" + re.escape(lv_name) + r"\b", line):
                     continue
             except re.error:
                 continue
-            # 仅在等号左侧出现不算"读取"
             if "=" in line:
                 try:
-                    if re.search(r'\b' + re.escape(lv_name) + r'\s*=', line):
+                    if re.search(r"\b" + re.escape(lv_name) + r"\s*=", line):
                         continue
                 except re.error:
                     pass
@@ -902,18 +731,17 @@ def _detect_unused_locals(
         if lv_name not in used_locals:
             results.append({
                 "priority": PRIORITY_LOW,
-                "relative_path": relative, "filename": filename,
-                "start_line": decl_line, "end_line": decl_line,
+                "relative_path": relative,
+                "filename": filename,
+                "start_line": decl_line,
+                "end_line": decl_line,
                 "issue_type": "未使用的局部变量",
                 "description": f"局部变量 '{lv_name}' 声明后仅赋值未读取",
             })
 
 
 def _dead_code_regex_only(file_path: Path, project_root: Path) -> List[Dict[str, Any]]:
-    """
-    大文件回退方案: 仅用正则检测未使用的 import。
-    对于超过大小阈值的文件，不做完整 AST 分析。
-    """
+    """大文件回退: 仅用正则检测未使用的 import。"""
     results: List[Dict[str, Any]] = []
     relative = rel_path(project_root, str(file_path))
     filename = file_path.name
@@ -925,7 +753,7 @@ def _dead_code_regex_only(file_path: Path, project_root: Path) -> List[Dict[str,
         return results
 
     source_lines = source.split("\n")
-    import_pattern = re.compile(r'^import\s+(static\s+)?([a-zA-Z0-9_.*]+)\s*;')
+    import_pattern = re.compile(r"^import\s+(static\s+)?([a-zA-Z0-9_.*]+)\s*;")
 
     for line_num, line in enumerate(source_lines, 1):
         try:
@@ -937,31 +765,201 @@ def _dead_code_regex_only(file_path: Path, project_root: Path) -> List[Dict[str,
             if short_name == "*":
                 continue
 
-            used = False
-            for i, sl in enumerate(source_lines, 1):
-                if i == line_num:
-                    continue
-                if re.search(r'\b' + re.escape(short_name) + r'\b', sl):
-                    used = True
-                    break
+            used = any(
+                i != line_num and re.search(r"\b" + re.escape(short_name) + r"\b", sl)
+                for i, sl in enumerate(source_lines, 1)
+            )
             if not used:
                 results.append({
                     "priority": PRIORITY_LOW,
-                    "relative_path": relative, "filename": filename,
-                    "start_line": line_num, "end_line": line_num,
+                    "relative_path": relative,
+                    "filename": filename,
+                    "start_line": line_num,
+                    "end_line": line_num,
                     "issue_type": "未使用的 import (正则回退)",
                     "description": f"import '{full_path}' 在文件中未被使用",
                 })
-        except re.error:
-            continue
-        except Exception:
+        except (re.error, Exception):
             continue
 
     return results
 
 
 # ====================================================================
-# 模块 3: Excel 输出
+# 输出: Markdown 报告
+# ====================================================================
+
+def write_markdown(
+    dup_results: List[Dict[str, Any]],
+    dead_results: List[Dict[str, Any]],
+    output_path: str,
+    project_root: Path,
+    project_name: str,
+    min_lines: int,
+    min_tokens: int,
+    scan_errors: List[str],
+    scan_summary: Dict[str, Any],
+) -> str:
+    """生成中文 Markdown 格式报告。"""
+    total = len(dup_results) + len(dead_results)
+    total_dup_lines = sum(
+        max(0, r.get("end_line", 0) - r.get("start_line", 0) + 1)
+        for r in dup_results
+    )
+    total_dead = len(dead_results)
+
+    now_str = datetime.now(CST).strftime("%Y-%m-%d %H:%M CST")
+
+    lines: List[str] = []
+    lines.append(f"# Java 代码质量扫描报告")
+    lines.append("")
+    lines.append(f"**项目**: {project_name}")
+    lines.append(f"**扫描时间**: {now_str}")
+    lines.append(f"**扫描范围**: {project_root}")
+    lines.append("")
+
+    # ── 概览统计表 ──
+    lines.append("## 📊 概览统计")
+    lines.append("")
+    lines.append("| 指标 | 数值 |")
+    lines.append("|------|------|")
+    lines.append(f"| 重复代码块数量 | {len(dup_results)} 个 |")
+    lines.append(f"| 重复代码总行数 | {total_dup_lines} 行 |")
+    lines.append(f"| 无用代码问题数 | {total_dead} 处 |")
+    lines.append(f"| 问题总数 | {total} 处 |")
+    lines.append(f"| jscpd 扫描文件数 | {scan_summary.get('jscpd_files', 0)} 个 |")
+    lines.append(f"| javalang 分析文件数 | {scan_summary.get('dead_files', 0)} 个 |")
+    lines.append(f"| 最小重复行数 | {min_lines} |")
+    lines.append(f"| 最小重复 token | {min_tokens} |")
+    lines.append("")
+
+    if scan_errors:
+        lines.append("### ⚠️ 扫描异常")
+        lines.append("")
+        for se in scan_errors:
+            lines.append(f"- {se}")
+        lines.append("")
+
+    # ── 严重程度分布 ──
+    high_count = sum(1 for r in dup_results if r.get("priority") == PRIORITY_HIGH)
+    med_count = sum(1 for r in dup_results if r.get("priority") == PRIORITY_MEDIUM)
+    low_count = sum(1 for r in dup_results if r.get("priority") == PRIORITY_LOW)
+
+    lines.append("### 重复代码严重程度分布")
+    lines.append("")
+    lines.append("| 严重程度 | 数量 |")
+    lines.append("|----------|------|")
+    lines.append(f"| 🔴 高 | {high_count} |")
+    lines.append(f"| 🟡 中 | {med_count} |")
+    lines.append(f"| 🟢 低 | {low_count} |")
+    lines.append("")
+
+    if total == 0:
+        lines.append("## 🎉 扫描结果")
+        lines.append("")
+        lines.append("太棒了！未发现任何重复代码或无用代码问题。代码质量良好。")
+        lines.append("")
+        lines.append("### 建议")
+        lines.append("")
+        lines.append("1. 继续保持良好的编码习惯")
+        lines.append("2. 定期使用本工具进行代码质量检查")
+        lines.append("3. 新增代码模块时建议再次扫描")
+        lines.append("")
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        return "\n".join(lines)
+
+    # ── Top N 重复代码（按严重程度排序） ──
+    sorted_dup = sorted(dup_results, key=lambda x: (
+        PRIORITY_ORDER.get(x.get("priority", PRIORITY_LOW), 99),
+        -(x.get("end_line", 0) - x.get("start_line", 0) + 1),
+    ))
+
+    top_n = min(20, len(sorted_dup))
+    if top_n > 0:
+        lines.append(f"## 🔄 重复代码 Top {top_n}")
+        lines.append("")
+
+        for i, item in enumerate(sorted_dup[:top_n], 1):
+            dup_lines_count = max(0, item.get("end_line", 0) - item.get("start_line", 0) + 1)
+            emoji = {"高": "🔴", "中": "🟡", "低": "🟢"}.get(item.get("priority", ""), "")
+            lines.append(f"### {i}. {emoji} {item.get('filename', '?')} (行 {item.get('start_line', 0)}-{item.get('end_line', 0)})")
+            lines.append("")
+            lines.append(f"- **文件**: `{item.get('relative_path', '?')}`")
+            lines.append(f"- **行号**: {item.get('start_line', 0)}-{item.get('end_line', 0)}")
+            lines.append(f"- **重复行数**: {dup_lines_count} 行")
+            lines.append(f"- **严重程度**: {item.get('priority', '?')}")
+            lines.append(f"- **详情**: {item.get('description', '')}")
+            lines.append("")
+
+    # ── 无用代码 Top ──
+    if dead_results:
+        sorted_dead = sorted(dead_results, key=lambda x: (
+            PRIORITY_ORDER.get(x.get("priority", PRIORITY_LOW), 99),
+            x.get("issue_type", ""),
+        ))
+
+        # 按类型分组统计
+        type_counts: Dict[str, int] = {}
+        for r in dead_results:
+            it = r.get("issue_type", "其他")
+            type_counts[it] = type_counts.get(it, 0) + 1
+
+        lines.append("## 🗑️ 无用代码")
+        lines.append("")
+
+        lines.append("### 类型分布")
+        lines.append("")
+        lines.append("| 类型 | 数量 |")
+        lines.append("|------|------|")
+        for t, c in sorted(type_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"| {t} | {c} |")
+        lines.append("")
+
+        dead_top_n = min(15, len(sorted_dead))
+        lines.append(f"### 无用代码 Top {dead_top_n}")
+        lines.append("")
+
+        for i, item in enumerate(sorted_dead[:dead_top_n], 1):
+            emoji = {"未使用的 private 字段": "🔸", "未使用的 private 方法": "🔸", "未使用的 import": "🔹", "未使用的局部变量": "🔹"}.get(item.get("issue_type", ""), "")
+            lines.append(f"{i}. {emoji} **{item.get('issue_type', '?')}** — `{item.get('filename', '?')}`")
+            lines.append(f"   - 文件: `{item.get('relative_path', '?')}`")
+            lines.append(f"   - 行号: {item.get('start_line', 0)}")
+            lines.append(f"   - 说明: {item.get('description', '')}")
+            lines.append("")
+
+    # ── 重构建议 ──
+    lines.append("## 💡 重构建议")
+    lines.append("")
+
+    high_items = [r for r in dup_results if r.get("priority") == PRIORITY_HIGH]
+    if high_items:
+        lines.append(f"1. **优先处理 {len(high_items)} 处高严重度重复代码**：这些重复代码跨文件且行数较多，建议提取公共基类或工具类")
+
+    med_items = [r for r in dup_results if r.get("priority") == PRIORITY_MEDIUM]
+    if med_items:
+        lines.append(f"2. **关注 {len(med_items)} 处中等严重度重复**：在重构高优先级代码时一并处理")
+
+    if dead_results:
+        lines.append(f"3. **清理 {len(dead_results)} 处无用代码**：未使用的 import、字段、方法和变量可以安全删除，减少代码噪音")
+        unused_imports = sum(1 for r in dead_results if "import" in r.get("issue_type", ""))
+        if unused_imports > 0:
+            lines.append(f"   - 其中 {unused_imports} 个未使用的 import 可直接使用 IDE 自动清理")
+
+    lines.append(f"4. 重构后务必运行单元测试，确保功能不受影响")
+    lines.append(f"5. 建议将本工具集成到 CI/CD 流程中，定期扫描代码质量")
+    lines.append("")
+
+    # ── 写入文件 ──
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    return "\n".join(lines)
+
+
+# ====================================================================
+# 输出: Excel 报告
 # ====================================================================
 
 def write_excel(
@@ -970,29 +968,19 @@ def write_excel(
     output_path: str,
     scan_errors: Optional[List[str]] = None,
 ) -> Optional[str]:
-    """
-    将扫描结果写入格式化的 Excel 文件。
-    如果无结果但有扫描异常信息，仍生成报告记录异常。
-
-    Returns:
-        输出路径，或 None（无结果且无异常时）。
-    """
+    """将扫描结果写入格式化的 Excel 文件。"""
     total = len(dup_results) + len(dead_results)
     has_errors = scan_errors and len(scan_errors) > 0
 
     if total == 0 and not has_errors:
         print("\n" + "=" * 60)
-        info("两次扫描均未发现问题，跳过 Excel 生成。")
+        info("两次扫描均未发现问题，跳过 Excel 生成")
         return None
 
     print("\n" + "=" * 60)
     info("聚合结果 & 生成 Excel")
     print("=" * 60)
 
-    header_dup = HEADER_DUPLICATE
-    header_dead = HEADER_DEAD_CODE
-
-    # 字段映射（内部字段名 → Excel 列索引）
     field_map = {
         "priority": 0,
         "relative_path": 1, "filename": 2,
@@ -1001,42 +989,39 @@ def write_excel(
     }
 
     def sort_by_priority(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """按重要程度排序：高→中→低，同级别保持原序。"""
-        return sorted(items, key=lambda x: PRIORITY_ORDER.get(x.get("priority", PRIORITY_LOW), 99))
+        return sorted(items, key=lambda x: (
+            PRIORITY_ORDER.get(x.get("priority", PRIORITY_LOW), 99),
+            -(x.get("end_line", 0) - x.get("start_line", 0) + 1),
+        ))
+
+    def build_df(results: List[Dict[str, Any]], header: List[str]) -> "pd.DataFrame":
+        if not results:
+            return pd.DataFrame(columns=header)
+        rows = []
+        for item in results:
+            row = {}
+            for field, col_idx in field_map.items():
+                row[header[col_idx]] = item.get(field, "")
+            rows.append(row)
+        return pd.DataFrame(rows)[header]
 
     try:
-        # 排序
         dup_results = sort_by_priority(dup_results)
         dead_results = sort_by_priority(dead_results)
 
-        def build_df(results: List[Dict[str, Any]], header: List[str]) -> pd.DataFrame:
-            """将结果列表构建为 DataFrame，映射字段到 header 列顺序。"""
-            if not results:
-                return pd.DataFrame(columns=header)
-            # 从结果中按 field_map 提取值
-            rows = []
-            for item in results:
-                row = {}
-                for field, col_idx in field_map.items():
-                    row[header[col_idx]] = item.get(field, "")
-                rows.append(row)
-            return pd.DataFrame(rows)[header]
+        df_dup = build_df(dup_results, HEADER_DUPLICATE)
+        df_dead = build_df(dead_results, HEADER_DEAD_CODE)
 
-        df_dup = build_df(dup_results, header_dup)
-        df_dead = build_df(dead_results, header_dead)
-
-        # 如果有扫描异常，在无用代码 Sheet 中添加说明行
+        # 追加扫描异常
         if has_errors:
             error_rows = []
             for i, err_msg in enumerate(scan_errors):
                 error_rows.append({
-                    header_dead[0]: PRIORITY_LOW,
-                    header_dead[1]: "",
-                    header_dead[2]: "",
-                    header_dead[3]: "",
-                    header_dead[4]: "",
-                    header_dead[5]: f"扫描异常 #{i+1}",
-                    header_dead[6]: err_msg,
+                    HEADER_DEAD_CODE[0]: PRIORITY_LOW,
+                    HEADER_DEAD_CODE[1]: "", HEADER_DEAD_CODE[2]: "",
+                    HEADER_DEAD_CODE[3]: "", HEADER_DEAD_CODE[4]: "",
+                    HEADER_DEAD_CODE[5]: f"扫描异常 #{i + 1}",
+                    HEADER_DEAD_CODE[6]: err_msg,
                 })
             df_error = pd.DataFrame(error_rows)
             df_dead = pd.concat([df_dead, df_error], ignore_index=True) if not df_dead.empty else df_error
@@ -1049,12 +1034,10 @@ def write_excel(
             df_dead.to_excel(writer, sheet_name="无用代码", index=False)
 
         info(f"已写入: {abspath}")
-
-        # 美化格式
         _format_excel(abspath)
-
         ok("格式美化完成")
-        print(f"\n  [DONE] 报告: {abspath}")
+
+        print(f"\n  [DONE] Excel 报告: {abspath}")
         print(f"         - 冗余重复代码: {len(df_dup)} 条")
         print(f"         - 无用代码:      {len(df_dead)} 条")
 
@@ -1066,33 +1049,44 @@ def write_excel(
 
 
 def _format_excel(filepath: str) -> None:
-    """美化 Excel 文件格式，异常不影响主流程。"""
+    """美化 Excel 文件格式。"""
     try:
         wb = load_workbook(filepath)
-        for sheet in ("冗余重复代码", "无用代码"):
-            ws = wb[sheet]
+        for sheet_name in ("冗余重复代码", "无用代码"):
+            ws = wb[sheet_name]
             try:
+                # 表头样式
                 for cell in ws[1]:
                     cell.font = HEADER_FONT
                     cell.fill = HEADER_FILL
                     cell.alignment = HEADER_ALIGN
                     cell.border = CELL_BORDER
+
+                # 数据行样式 + 优先级行颜色
                 for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+                    priority_val = str(row[0].value) if row[0].value else ""
+                    row_fill = PRIORITY_FILLS.get(priority_val)
                     for cell in row:
                         cell.alignment = CELL_ALIGN
                         cell.border = CELL_BORDER
+                        if row_fill:
+                            cell.fill = row_fill
+
+                # 自动列宽
                 for ci in range(1, ws.max_column + 1):
-                    cl = chr(64 + ci)
+                    col_letter = chr(64 + ci)
                     max_w = 10
-                    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=ci, max_col=ci):
+                    for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, 200),
+                                             min_col=ci, max_col=ci):
                         for cell in row:
                             if cell.value:
-                                w = sum(2 if ord(c) > 127 else 1 for c in str(cell.value))
+                                w = sum(2 if ord(c) > 127 else 1 for c in str(cell.value)[:50])
                                 max_w = max(max_w, w)
-                    ws.column_dimensions[cl].width = min(max_w + 2, 80)
+                    ws.column_dimensions[col_letter].width = min(max_w + 2, 80)
+
                 ws.freeze_panes = "A2"
             except Exception:
-                warn(f"Sheet '{sheet}' 美化异常，跳过")
+                warn(f"Sheet '{sheet_name}' 美化异常，跳过")
                 continue
         wb.save(filepath)
     except Exception as e:
@@ -1105,103 +1099,183 @@ def _format_excel(filepath: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Java Code Scanner v2 - 冗余代码 + 无用代码扫描",
+        description="Java Code Scanner v2 - 冗余重复代码 + 无用代码扫描",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例:
-  python main.py --project-path /path/to/java/project
-  python main.py --project-path ./my-java-project --output ./report.xlsx
-
-Windows (cmd):
-  set SKIP_JSCPD=1 && python main.py --project-path C:\\project
-
-Linux/macOS:
-  SKIP_JSCPD=1 python3 main.py --project-path /path
+  python main.py --project-path /path/to/java/src
+  python main.py --project-path ./src --output ./report.md
+  python main.py --project-path ./src --min-lines 5 --min-tokens 100
+  python main.py --project-path ./src --skip-jscpd
+  python main.py --project-path ./src --skip-dead-code
         """,
     )
-    parser.add_argument("--project-path", required=True, help="待扫描的 Java 项目根目录")
-    parser.add_argument("--output", default=None, help="Excel 报告输出路径")
+    parser.add_argument(
+        "--project-path", required=True,
+        help="扫描目标目录（直接传给 jscpd，智能体负责找到包含 Java 文件的目录）",
+    )
+    parser.add_argument(
+        "--output", default=None,
+        help="报告输出路径。.md 结尾生成 Markdown，.xlsx 结尾生成 Excel，否则同时生成两种",
+    )
+    parser.add_argument(
+        "--min-lines", type=int, default=3,
+        help="jscpd 最小重复行数 (默认: 3)",
+    )
+    parser.add_argument(
+        "--min-tokens", type=int, default=50,
+        help="jscpd 最小重复 token 数 (默认: 50)",
+    )
+    parser.add_argument(
+        "--skip-jscpd", action="store_true",
+        help="跳过冗余重复代码扫描",
+    )
+    parser.add_argument(
+        "--skip-dead-code", action="store_true",
+        help="跳过无用代码扫描",
+    )
     args = parser.parse_args()
 
     print("=" * 60)
     print("  Java Code Scanner v2")
-    print("  冗余代码扫描 (jscpd) + 无用代码扫描 (javalang AST)")
+    print("  冗余重复代码 (jscpd) + 无用代码 (javalang AST)")
     print("=" * 60)
 
     # 1. 验证项目路径
     try:
-        project_root = resolve_project_path(args.project_path)
+        project_root = resolve_path(args.project_path)
         info(f"项目: {project_root}")
     except (FileNotFoundError, NotADirectoryError) as e:
         err(str(e))
         sys.exit(1)
 
-    output_path = args.output or os.path.join(str(project_root), "java-code-report.xlsx")
-    info(f"输出: {output_path}")
+    # 确定输出路径和格式
+    output_md: Optional[str] = None
+    output_xlsx: Optional[str] = None
+    project_name = project_root.name or str(project_root)
+
+    if args.output:
+        out = args.output
+        if out.endswith(".md"):
+            output_md = out
+        elif out.endswith(".xlsx"):
+            output_xlsx = out
+        else:
+            # 同时生成两种
+            output_md = out + ".md"
+            output_xlsx = out + ".xlsx"
+    else:
+        # 默认同时生成
+        output_md = os.path.join(str(project_root), "java-code-report.md")
+        output_xlsx = os.path.join(str(project_root), "java-code-report.xlsx")
+
+    info(f"输出: markdown={output_md or '(跳过)'}, excel={output_xlsx or '(跳过)'}")
 
     # 2. 环境检查
     env = check_environment()
 
-    # 3. 扫描目标路径选择（支持多模块项目）
-    scan_targets = select_scan_target(project_root)
-    info(f"待扫描模块: {len(scan_targets)} 个")
-
-    # 4. 创建临时目录
+    # 3. 创建临时目录
     tmpdir = tempfile.TemporaryDirectory(prefix="java-code-scanner-")
     info(f"临时目录: {tmpdir.name}\n")
 
     dup_results: List[Dict[str, Any]] = []
     dead_results: List[Dict[str, Any]] = []
-    scan_errors: List[str] = []  # 记录扫描异常信息，写入报告中
-
-    skip_jscpd = os.environ.get("SKIP_JSCPD", "").lower() in ("1", "true", "yes")
-    skip_jscpd2 = os.environ.get("SKIP_JSCPD2", "").lower() in ("1", "true", "yes")
+    scan_errors: List[str] = []
+    scan_summary: Dict[str, Any] = {
+        "jscpd_files": 0,
+        "jscpd_clones": 0,
+        "dead_files": 0,
+    }
 
     try:
-        # 5a. 冗余代码扫描（一次性扫所有目标模块，支持跨模块重复检测）
-        if skip_jscpd or skip_jscpd2:
-            skip("SKIP_JSCPD 已设置，跳过")
-        elif not env.get("jscpd", False):
+        # 4a. 冗余代码扫描
+        if args.skip_jscpd:
+            skip("--skip-jscpd，跳过")
+        elif not env.get("jscpd"):
             skip("jscpd 未安装，跳过")
         else:
-            dup_results, dup_err = scan_duplicate(scan_targets, tmpdir.name, project_root)
-            if dup_err:
-                scan_errors.append(f"[冗余代码] {dup_err}")
+            dup_results, dup_errors, jscpd_files, jscpd_clones = scan_duplicate(
+                project_root, tmpdir.name, project_root,
+                min_lines=args.min_lines, min_tokens=args.min_tokens,
+            )
+            scan_errors.extend(dup_errors)
+            scan_summary["jscpd_files"] = jscpd_files
+            scan_summary["jscpd_clones"] = jscpd_clones
 
-        # 5b. 无用代码扫描（每个模块单独扫描，AST 分析不跨模块）
-        for i, scan_root in enumerate(scan_targets, 1):
-            module_label = f"模块 {i}/{len(scan_targets)}"
-            if not env.get("javalang", False):
-                skip("javalang 未安装，跳过")
-                break
-            dead_batch, dead_err = scan_dead_code(scan_root, project_root)
-            dead_results.extend(dead_batch)
-            if dead_err:
-                scan_errors.append(f"[{module_label} 无用代码] {dead_err}")
-            info(f"{module_label} 无用代码扫描完成")
+        # 4b. 无用代码扫描
+        if args.skip_dead_code:
+            skip("--skip-dead-code，跳过")
+        elif not env.get("javalang"):
+            skip("javalang 未安装，跳过")
+        else:
+            dead_results, dead_errors = scan_dead_code(project_root, project_root)
+            scan_errors.extend(dead_errors)
+            scan_summary["dead_files"] = len(dead_results)
 
-        # 6. 生成 Excel（如果有异常信息也记录）
-        if scan_errors:
-            info(f"扫描过程存在 {len(scan_errors)} 个异常")
-            for se in scan_errors:
-                err(se)
-        write_excel(dup_results, dead_results, output_path, scan_errors)
+        # 5. 生成报告
+        markdown_content: Optional[str] = None
 
-        # 7. 汇总
+        if output_md:
+            print("\n" + "=" * 60)
+            info("生成 Markdown 报告")
+            print("=" * 60)
+            try:
+                markdown_content = write_markdown(
+                    dup_results, dead_results, output_md,
+                    project_root, project_name,
+                    args.min_lines, args.min_tokens,
+                    scan_errors, scan_summary,
+                )
+                ok(f"Markdown 报告: {output_md}")
+            except Exception as e:
+                err(f"Markdown 报告生成失败: {e}")
+                scan_errors.append(f"[Markdown] {e}")
+
+        if output_xlsx:
+            try:
+                if not HAS_PANDAS or not HAS_OPENPYXL:
+                    skip("pandas 或 openpyxl 未安装，跳过 Excel 报告")
+                else:
+                    write_excel(dup_results, dead_results, output_xlsx, scan_errors)
+            except Exception as e:
+                err(f"Excel 报告生成失败: {e}")
+                scan_errors.append(f"[Excel] {e}")
+
+        # 6. 汇总
         total = len(dup_results) + len(dead_results)
         print(f"\n  {'=' * 58}")
-        print(f"  扫描汇总: 共 {total} 处问题（共扫描 {len(scan_targets)} 个模块）")
+        print(f"  扫描汇总: 共 {total} 处问题")
         print(f"    - 冗余重复代码: {len(dup_results)} 处")
         print(f"    - 无用代码:     {len(dead_results)} 处")
         print(f"  {'=' * 58}")
+
+        # 打印简要的 markdown 报告到控制台
+        if markdown_content:
+            print("\n" + "─" * 60)
+            print("  📄 Markdown 报告预览 (前 60 行)")
+            print("─" * 60)
+            preview_lines = markdown_content.split("\n")[:60]
+            for pl in preview_lines:
+                print(f"  {pl}")
+            if len(markdown_content.split("\n")) > 60:
+                print(f"  ... (共 {len(markdown_content.split(chr(10)))} 行)")
 
     except KeyboardInterrupt:
         warn("用户中断")
         sys.exit(130)
     except Exception as e:
         err(f"扫描异常: {e}")
+        import traceback
+        traceback.print_exc()
+        # 尝试生成已有结果
         if dup_results or dead_results:
             try:
-                write_excel(dup_results, dead_results, output_path)
+                if output_xlsx and HAS_PANDAS:
+                    write_excel(dup_results, dead_results, output_xlsx)
+                if output_md:
+                    write_markdown(dup_results, dead_results, output_md,
+                                   project_root, project_name,
+                                   args.min_lines, args.min_tokens,
+                                   scan_errors, scan_summary)
             except Exception:
                 pass
         sys.exit(1)
