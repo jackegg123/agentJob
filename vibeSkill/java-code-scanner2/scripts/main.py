@@ -410,8 +410,8 @@ def scan_duplicate(scan_targets: List[Path], temp_dir: str, project_root: Path) 
             "--reporters", "json",
             "--output", temp_dir,
             "--threshold", "0",
-            "--min-lines", "6",
-            "--min-tokens", "50",
+            "--min-lines", "3",
+            "--min-tokens", "10",
         ]
         result = run_cmd(cmd, cwd=str(project_root), timeout=600)
 
