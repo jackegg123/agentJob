@@ -493,11 +493,11 @@ def scan_duplicate(scan_targets: List[Path], temp_dir: str, project_root: Path) 
             # 非致命错误，先尝试找报告
             warn(f"jscpd 异常退出（退出码 {result.returncode}）：检查是否生成了报告")
 
-    # 查找生成的 JSON 报告
+    # 查找生成的 JSON 报告（排除配置文件 .jscpd.json）
     report_path: Optional[str] = None
     for root, _, files in os.walk(temp_dir):
         for f in files:
-            if f.endswith(".json") and "jscpd" in f.lower():
+            if f.endswith(".json") and "jscpd" in f.lower() and f != ".jscpd.json":
                 report_path = os.path.join(root, f)
                 break
         if report_path:
