@@ -237,11 +237,16 @@ def scan_project_structure(project_root: Path) -> List[str]:
     return sorted_dirs
 
 
-def select_scan_target(project_root: Path) -> Path:
+def select_scan_target(project_root: Path) -> List[Path]:
     """
-    交互式选择扫描目标路径。
-    如果用户输入了 --project-path 且项目根有 java 文件，直接使用根目录。
-    否则列出子模块让用户选择。
+    选择扫描目标路径。
+    返回一个路径列表（可能包含多个模块）。
+
+    行为：
+    - 如果项目根目录包含 Java 文件，直接返回 [根目录]
+    - 否则列出子模块，提示用户选择：
+      - 输入编号 → 只扫描对应模块
+      - 输入 0 或直接回车（不输入）→ 扫描所有模块（兜底逻辑）
     """
     # 检查根目录是否包含 Java 文件
     root_has_java = False
@@ -258,31 +263,35 @@ def select_scan_target(project_root: Path) -> Path:
 
     if root_has_java:
         info("项目根目录包含 Java 文件，直接扫描根目录")
-        return project_root
+        return [project_root]
 
     # 列出子模块让用户选择
     dirs = scan_project_structure(project_root)
 
     if not dirs:
         warn("项目中未找到任何 Java 文件")
-        return project_root
+        return [project_root]
 
     try:
-        choice = input("\n  请输入编号: ").strip()
+        choice = input("\n  请输入编号（直接回车=扫描全部模块）: ").strip()
+        if not choice:
+            # 兜底：用户没有输入编号，扫描所有模块
+            info("未输入编号，扫描所有模块")
+            return [project_root / d for d in dirs]
         idx = int(choice)
         if idx == 0:
-            info("扫描整个项目根目录")
-            return project_root
+            info("扫描所有模块")
+            return [project_root / d for d in dirs]
         if 1 <= idx <= len(dirs):
             selected = project_root / dirs[idx - 1]
             info(f"扫描子目录: {dirs[idx - 1]}")
-            return selected
+            return [selected]
         else:
-            warn(f"无效选择，扫描整个项目根目录")
-            return project_root
+            warn(f"无效选择，扫描所有模块")
+            return [project_root / d for d in dirs]
     except (ValueError, IndexError):
-        warn("输入无效，扫描整个项目根目录")
-        return project_root
+        warn("输入无效，扫描所有模块")
+        return [project_root / d for d in dirs]
 
 
 # ====================================================================
@@ -984,7 +993,8 @@ Linux/macOS:
     env = check_environment()
 
     # 3. 扫描目标路径选择（支持多模块项目）
-    scan_root = select_scan_target(project_root)
+    scan_targets = select_scan_target(project_root)
+    info(f"待扫描模块: {len(scan_targets)} 个")
 
     # 4. 创建临时目录
     tmpdir = tempfile.TemporaryDirectory(prefix="java-code-scanner-")
@@ -994,26 +1004,38 @@ Linux/macOS:
     dead_results: List[Dict[str, Any]] = []
     scan_errors: List[str] = []  # 记录扫描异常信息，写入报告中
 
-    try:
-        # 5. 冗余代码扫描
-        skip_jscpd = os.environ.get("SKIP_JSCPD", "").lower() in ("1", "true", "yes")
-        skip_jscpd2 = os.environ.get("SKIP_JSCPD2", "").lower() in ("1", "true", "yes")
-        if skip_jscpd or skip_jscpd2:
-            skip("SKIP_JSCPD 已设置，跳过")
-        elif not env.get("jscpd", False):
-            skip("jscpd 未安装，跳过")
-        else:
-            dup_results, dup_err = scan_duplicate(scan_root, tmpdir.name, project_root)
-            if dup_err:
-                scan_errors.append(f"[冗余代码] {dup_err}")
+    skip_jscpd = os.environ.get("SKIP_JSCPD", "").lower() in ("1", "true", "yes")
+    skip_jscpd2 = os.environ.get("SKIP_JSCPD2", "").lower() in ("1", "true", "yes")
 
-        # 5. 无用代码扫描
-        if not env.get("javalang", False):
-            skip("javalang 未安装，跳过")
-        else:
-            dead_results, dead_err = scan_dead_code(scan_root, project_root)
-            if dead_err:
-                scan_errors.append(f"[无用代码] {dead_err}")
+    try:
+        # 5. 对每个目标模块执行扫描
+        for i, scan_root in enumerate(scan_targets, 1):
+            module_label = f"模块 {i}/{len(scan_targets)}"
+            print(f"\n{'=' * 60}")
+            info(f"{module_label}: {scan_root}")
+            print(f"{'=' * 60}")
+
+            # 5a. 冗余代码扫描
+            if skip_jscpd or skip_jscpd2:
+                skip("SKIP_JSCPD 已设置，跳过")
+            elif not env.get("jscpd", False):
+                skip("jscpd 未安装，跳过")
+            else:
+                dup_batch, dup_err = scan_duplicate(scan_root, tmpdir.name, project_root)
+                dup_results.extend(dup_batch)
+                if dup_err:
+                    scan_errors.append(f"[{module_label} 冗余代码] {dup_err}")
+
+            # 5b. 无用代码扫描
+            if not env.get("javalang", False):
+                skip("javalang 未安装，跳过")
+            else:
+                dead_batch, dead_err = scan_dead_code(scan_root, project_root)
+                dead_results.extend(dead_batch)
+                if dead_err:
+                    scan_errors.append(f"[{module_label} 无用代码] {dead_err}")
+
+            info(f"{module_label} 扫描完成")
 
         # 6. 生成 Excel（如果有异常信息也记录）
         if scan_errors:
@@ -1025,7 +1047,7 @@ Linux/macOS:
         # 7. 汇总
         total = len(dup_results) + len(dead_results)
         print(f"\n  {'=' * 58}")
-        print(f"  扫描汇总: 共 {total} 处问题")
+        print(f"  扫描汇总: 共 {total} 处问题（共扫描 {len(scan_targets)} 个模块）")
         print(f"    - 冗余重复代码: {len(dup_results)} 处")
         print(f"    - 无用代码:     {len(dead_results)} 处")
         print(f"  {'=' * 58}")

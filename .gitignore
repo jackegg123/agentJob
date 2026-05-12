@@ -1,36 +1,33 @@
-# 个人配置文件
-AGENTS.md
-HEARTBEAT.md
-IDENTITY.md
-SOUL.md
-TOOLS.md
-USER.md
-MEMORY.md
-memory/
-.openclaw/
-feishu.patch.json5
-claude-settings-*.json
-
-# 环境变量和密钥
-.env
-.env.local
-*.key
-secrets/
 
 # IDE
-.vscode/
-.idea/
-
-# 系统文件
-.DS_Store
-Thumbs.db
-*.log
-
+# 个人配置文件
 # 临时文件
+# 敏感配置文档 - 可能包含API密钥
+# 环境变量和密钥
+# 系统文件
+*.key
+*.log
 *.swp
 *~
-
-# 敏感配置文档 - 可能包含API密钥
+.DS_Store
+.env
+.env.local
+.idea/
+.openclaw/
+.vscode/
+AGENTS.md
 CLAUDE_DEEPSEEK_SETUP.md
-SETUP.md
+HEARTBEAT.md
+IDENTITY.md
+MEMORY.md
 README_SETUP.md
+SETUP.md
+SOUL.md
+TOOLS.md
+Thumbs.db
+USER.md
+claude-settings-*.json
+feishu.patch.json5
+memory/
+secrets/
+venv/
