@@ -466,25 +466,30 @@ def scan_duplicate(scan_targets: List[Path], temp_dir: str, project_root: Path) 
 
         for dup in duplicates:
             try:
-                first = dup.get("first", {})
-                second = dup.get("second", {})
-
-                def get_line(loc) -> int:
-                    if isinstance(loc, dict):
-                        return loc.get("line", 0)
-                    return loc or 0
+                first = dup.get("firstFile", {})
+                second = dup.get("secondFile", {})
 
                 f_file = first.get("name", "") or first.get("path", "")
                 if not f_file:
                     continue
-                f_start = get_line(first.get("start", first.get("startLine", 0)))
-                f_end = get_line(first.get("end", first.get("endLine", 0)))
+                # jscpd 输出的行号直接是整数（start/end 字段），
+                # 部分版本嵌套在 startLoc.line / endLoc.line 中
+                f_start = first.get("start", 0)
+                f_end = first.get("end", 0)
+                if not isinstance(f_start, int):
+                    f_start = first.get("startLoc", {}).get("line", 0)
+                if not isinstance(f_end, int):
+                    f_end = first.get("endLoc", {}).get("line", 0)
 
                 s_file = second.get("name", "") or second.get("path", "")
                 if not s_file:
                     continue
-                s_start = get_line(second.get("start", second.get("startLine", 0)))
-                s_end = get_line(second.get("end", second.get("endLine", 0)))
+                s_start = second.get("start", 0)
+                s_end = second.get("end", 0)
+                if not isinstance(s_start, int):
+                    s_start = second.get("startLoc", {}).get("line", 0)
+                if not isinstance(s_end, int):
+                    s_end = second.get("endLoc", {}).get("line", 0)
 
                 s_filename = os.path.basename(s_file)
                 desc = (
