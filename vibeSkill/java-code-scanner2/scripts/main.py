@@ -36,15 +36,22 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 # 常量
 # ====================================================================
 
+PRIORITY_HIGH = "高"
+PRIORITY_MEDIUM = "中"
+PRIORITY_LOW = "低"
+
 HEADER_DUPLICATE = [
-    "项目相对路径", "文件名", "起始行", "结束行",
+    "重要程度", "项目相对路径", "文件名", "起始行", "结束行",
     "问题类型", "详细说明（重复代码位置）",
 ]
 
 HEADER_DEAD_CODE = [
-    "项目相对路径", "文件名", "起始行", "结束行",
+    "重要程度", "项目相对路径", "文件名", "起始行", "结束行",
     "问题类型", "详细说明（为什么无用）",
 ]
+
+# 优先级排序权重（用于排序：高→中→低）
+PRIORITY_ORDER = {PRIORITY_HIGH: 0, PRIORITY_MEDIUM: 1, PRIORITY_LOW: 2}
 
 HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=11)
 HEADER_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
@@ -485,7 +492,20 @@ def scan_duplicate(scan_targets: List[Path], temp_dir: str, project_root: Path) 
                     f" (文件: {rel_path(project_root, s_file)})"
                 )
 
+                dup_lines = f_end - f_start + 1
+                # 优先级：跨文件重复 + 行数多的函数级重复 = 高
+                # 非跨文件但行数多 = 中
+                # 行数少的小重复 = 低
+                is_cross_file = os.path.basename(f_file) != os.path.basename(s_file)
+                if dup_lines >= 10 and is_cross_file:
+                    priority = PRIORITY_HIGH
+                elif dup_lines >= 6:
+                    priority = PRIORITY_MEDIUM
+                else:
+                    priority = PRIORITY_LOW
+
                 results.append({
+                    "priority": priority,
                     "relative_path": rel_path(project_root, f_file),
                     "filename": os.path.basename(f_file),
                     "start_line": f_start,
@@ -670,6 +690,7 @@ def _detect_unused_imports(
                 )
             if not used:
                 results.append({
+                    "priority": PRIORITY_LOW,
                     "relative_path": relative, "filename": filename,
                     "start_line": (imp.position.line if imp.position else 1),
                     "end_line": (imp.position.line if imp.position else 1),
@@ -734,6 +755,7 @@ def _detect_unused_fields(
     for fnode, fn in private_fields:
         if fn not in used_fields:
             results.append({
+                "priority": PRIORITY_MEDIUM,
                 "relative_path": relative, "filename": filename,
                 "start_line": (fnode.position.line if fnode.position else 1),
                 "end_line": (fnode.position.line if fnode.position else 1),
@@ -780,6 +802,7 @@ def _detect_unused_methods(
     for mnode, mn in private_methods:
         if mn not in used_methods:
             results.append({
+                "priority": PRIORITY_MEDIUM,
                 "relative_path": relative, "filename": filename,
                 "start_line": (mnode.position.line if mnode.position else 1),
                 "end_line": (mnode.position.line if mnode.position else 1),
@@ -830,6 +853,7 @@ def _detect_unused_locals(
     for lv_name, decl_line in local_vars:
         if lv_name not in used_locals:
             results.append({
+                "priority": PRIORITY_LOW,
                 "relative_path": relative, "filename": filename,
                 "start_line": decl_line, "end_line": decl_line,
                 "issue_type": "未使用的局部变量",
@@ -874,6 +898,7 @@ def _dead_code_regex_only(file_path: Path, project_root: Path) -> List[Dict[str,
                     break
             if not used:
                 results.append({
+                    "priority": PRIORITY_LOW,
                     "relative_path": relative, "filename": filename,
                     "start_line": line_num, "end_line": line_num,
                     "issue_type": "未使用的 import (正则回退)",
@@ -919,34 +944,51 @@ def write_excel(
     header_dup = HEADER_DUPLICATE
     header_dead = HEADER_DEAD_CODE
 
-    try:
-        df_dup = pd.DataFrame(dup_results) if dup_results else pd.DataFrame(columns=header_dup)
-        if not df_dup.empty:
-            df_dup = df_dup.rename(columns={
-                "relative_path": header_dup[0], "filename": header_dup[1],
-                "start_line": header_dup[2], "end_line": header_dup[3],
-                "issue_type": header_dup[4], "description": header_dup[5],
-            })[header_dup]
+    # 字段映射（内部字段名 → Excel 列索引）
+    field_map = {
+        "priority": 0,
+        "relative_path": 1, "filename": 2,
+        "start_line": 3, "end_line": 4,
+        "issue_type": 5, "description": 6,
+    }
 
-        df_dead = pd.DataFrame(dead_results) if dead_results else pd.DataFrame(columns=header_dead)
-        if not df_dead.empty:
-            df_dead = df_dead.rename(columns={
-                "relative_path": header_dead[0], "filename": header_dead[1],
-                "start_line": header_dead[2], "end_line": header_dead[3],
-                "issue_type": header_dead[4], "description": header_dead[5],
-            })[header_dead]
+    def sort_by_priority(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """按重要程度排序：高→中→低，同级别保持原序。"""
+        return sorted(items, key=lambda x: PRIORITY_ORDER.get(x.get("priority", PRIORITY_LOW), 99))
+
+    try:
+        # 排序
+        dup_results = sort_by_priority(dup_results)
+        dead_results = sort_by_priority(dead_results)
+
+        def build_df(results: List[Dict[str, Any]], header: List[str]) -> pd.DataFrame:
+            """将结果列表构建为 DataFrame，映射字段到 header 列顺序。"""
+            if not results:
+                return pd.DataFrame(columns=header)
+            # 从结果中按 field_map 提取值
+            rows = []
+            for item in results:
+                row = {}
+                for field, col_idx in field_map.items():
+                    row[header[col_idx]] = item.get(field, "")
+                rows.append(row)
+            return pd.DataFrame(rows)[header]
+
+        df_dup = build_df(dup_results, header_dup)
+        df_dead = build_df(dead_results, header_dead)
 
         # 如果有扫描异常，在无用代码 Sheet 中添加说明行
         if has_errors:
             error_rows = []
             for i, err_msg in enumerate(scan_errors):
                 error_rows.append({
-                    header_dead[0]: "",
+                    header_dead[0]: PRIORITY_LOW,
                     header_dead[1]: "",
                     header_dead[2]: "",
                     header_dead[3]: "",
-                    header_dead[4]: f"扫描异常 #{i+1}",
-                    header_dead[5]: err_msg,
+                    header_dead[4]: "",
+                    header_dead[5]: f"扫描异常 #{i+1}",
+                    header_dead[6]: err_msg,
                 })
             df_error = pd.DataFrame(error_rows)
             df_dead = pd.concat([df_dead, df_error], ignore_index=True) if not df_dead.empty else df_error
