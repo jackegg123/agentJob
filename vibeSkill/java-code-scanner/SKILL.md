@@ -1,5 +1,5 @@
 ---
-name: java-code-scanner2
+name: java-code-scanner
 version: 2.0.0
 description: >
   Scan Java projects for duplicate code and dead code (unused imports, fields,
