@@ -1,47 +1,44 @@
 ---
 name: java-code-scanner
-version: 2.0.0
+version: 1.0.0
 description: >
-  Scan Java projects for duplicate code and dead code (unused imports, fields,
-  methods, and local variables). Detects redundant code via jscpd and unused
-  code via javalang AST parser, generating both Markdown and Excel reports.
-  扫描 Java 项目中的冗余代码和无用代码（未使用的 import、字段、方法、局部变量）。
-  通过 jscpd 检测冗余代码，通过 javalang AST 解析器检测死代码，生成 Markdown + Excel 报告。
+  Analyze Java projects for duplicate code (via jscpd) and dead code
+  (unused imports/fields/methods/variables via javalang AST).
+  Generates a structured Chinese Markdown report with severity levels
+  and refactoring suggestions.
+  扫描 Java 项目中的重复代码（jscpd）和无用代码（javalang AST），
+  生成带严重程度和重构建议的中文 Markdown 报告。
 
 tags:
   - java
   - code-quality
-  - scanner
   - duplicate-code
   - dead-code
-  - lint
+  - jscpd
 
 input:
   project_path:
     type: string
     description: >
-      Absolute or relative path to the Java source directory to scan.
-      If the path doesn't contain .java files directly, the agent should
-      recursively find subdirectories containing Java files and pass one to the script.
-      要扫描的 Java 源码目录的绝对或相对路径。
+      Path to the Java project or source directory to scan.
+      要扫描的 Java 项目或源码目录路径。
     required: true
   output:
     type: string
     description: >
-      Output report path. `.md` suffix → Markdown, `.xlsx` suffix → Excel,
-      otherwise generates both. Default: project_dir/java-code-report.{md,xlsx}
-      报告输出路径。
+      Path for the generated Markdown report (default: project_dir/java-analysis-report.md).
+      Markdown 报告输出路径。
     required: false
-  min_lines:
-    type: integer
-    description: "Minimum duplicate line count for jscpd (default: 3)"
-    required: false
-    default: 3
   min_tokens:
     type: integer
     description: "Minimum duplicate token count for jscpd (default: 50)"
     required: false
     default: 50
+  min_lines:
+    type: integer
+    description: "Minimum duplicate line count for jscpd (default: 5)"
+    required: false
+    default: 5
   skip_jscpd:
     type: boolean
     description: "Skip duplicate code scan"
@@ -58,177 +55,103 @@ steps:
     description: |
       Install required dependencies.
 
-      Prerequisites:
-      - Python >= 3.9
-      - Node.js >= 16 (for jscpd)
-
-      Install commands:
-
-      **Python dependencies:**
-      ```bash
-      pip install -r requirements.txt
-      ```
-
-      **jscpd (global):**
+      **jscpd (Node.js):**
       ```bash
       npm install -g jscpd
       ```
-      On Windows, if `jscpd` is not found after installation, add the npm global
-      bin directory to your system PATH, then restart your terminal.
+      If Windows PATH issues, use `npx jscpd` instead.
 
-      Verify installation:
+      **Python dependencies:**
       ```bash
-      python scripts/main.py --help
+      pip install javalang
+      # javalang is the only Python dependency (standard library used for report generation)
       ```
 
   - id: FindJavaDir
     description: |
-      **🔍 Step 1: 找到正确的 Java 代码目录（智能体工作流）**
+      **🔍 Step 1: 找到包含 Java 代码的目录（由智能体完成）**
 
-      本脚本不再内置交互式目录选择。智能体负责在调用脚本前找到正确的目录。
+      智能体需要找到正确的扫描目录后调用脚本。方法：
 
-      ### 工作流
-
-      1. **检查用户提供的路径**是否直接包含 `.java` 文件
+      1. 先检查用户提供的路径下是否直接有 `.java` 文件：
          ```bash
-         find {{project_path}} -maxdepth 1 -name "*.java" | head -3
+         find "{{project_path}}" -maxdepth 1 -name "*.java" | head -3
          ```
-      2. 如果有 Java 文件 → 直接使用该路径作为 `--project-path`
-      3. 如果没有 → **递归查找**包含 Java 文件的子目录：
+      2. 如果有 → 直接使用该路径
+      3. 如果没有 → 递归查找：
          ```bash
-         find {{project_path}} -name "*.java" -not -path "*/test/*" -not -path "*/target/*" | head -20
+         find "{{project_path}}" -name "*.java" -not -path "*/test/*" -not -path "*/target/*" | head -20
          ```
-      4. 分析找到的 Java 文件分布，**选择一个最合适的目录**传给脚本：
-         - 优先选择 `src/main/java` 目录
-         - 如果没有标准目录结构，选择 Java 文件数量最多的父目录
-         - 将选中的目录作为 `--project-path` 参数
+      4. 分析结果，选择合适的目录：
+         - 优先 `src/main/java`
+         - 否则选 Java 文件最多的父目录
+         - 传给 `--project-path`
 
-      ### 示例
-
-      用户说 "扫描 /home/user/my-java-project"：
-
-      ```
-      # 智能体执行
-      # 1. 检查根目录
-      find /home/user/my-java-project -maxdepth 1 -name "*.java"
-      # 结果: 空
-
-      # 2. 递归查找
-      find /home/user/my-java-project -name "*.java" -not -path "*/test/*" | head -5
-      # 输出:
-      # /home/user/my-java-project/module-a/src/main/java/com/example/Service.java
-      # /home/user/my-java-project/module-a/src/main/java/com/example/Controller.java
-      # /home/user/my-java-project/module-b/src/main/java/com/example/Dao.java
-
-      # 3. 智能体确定：最佳扫描目录是项目根目录（jscpd 会递归扫描子目录）
-      # → 使用 --project-path /home/user/my-java-project
-      ```
-
-  - id: Run
+  - id: RunJscpd
     description: |
-      **🚀 Step 2: 运行扫描**
+      **🔄 Step 2: 运行 jscpd 扫描重复代码**
 
-      使用在 Step 1 中找到的目录路径执行扫描。
+      智能体直接执行 jscpd（不用 Python 脚本封装）：
 
-      **基本用法:**
+      **Basic:**
       ```bash
-      python3 scripts/main.py --project-path "{{java_source_dir}}"
+      jscpd "{{scan_dir}}" --pattern "**/*.java" --min-tokens {{min_tokens}} --min-lines {{min_lines}} --reporters json --output .jscpd-report
       ```
 
-      **指定输出路径:**
+      如果 jscpd 不在 PATH 中，使用 npx：
       ```bash
-      # Markdown 报告
-      python3 scripts/main.py --project-path "{{java_source_dir}}" --output ./java-scan-report.md
-
-      # Excel 报告
-      python3 scripts/main.py --project-path "{{java_source_dir}}" --output ./java-scan-report.xlsx
-
-      # 同时生成两种（默认）
-      python3 scripts/main.py --project-path "{{java_source_dir}}" --output ./java-scan-report
+      npx jscpd "{{scan_dir}}" --pattern "**/*.java" --min-tokens {{min_tokens}} --min-lines {{min_lines}} --reporters json --output .jscpd-report
       ```
 
-      **自定义扫描参数:**
-      ```bash
-      # 更严格的参数
-      python3 scripts/main.py --project-path ./src --min-lines 5 --min-tokens 100
-
-      # 更宽松的参数
-      python3 scripts/main.py --project-path ./src --min-lines 2 --min-tokens 30
-      ```
-
-      **跳过特定扫描:**
-      ```bash
-      # 只扫描无用代码
-      python3 scripts/main.py --project-path ./src --skip-jscpd
-
-      # 只扫描重复代码
-      python3 scripts/main.py --project-path ./src --skip-dead-code
-      ```
+      jscpd 会在 `.jscpd-report/jscpd-report.json` 生成 JSON 报告。
 
       **Windows (cmd):**
       ```cmd
-      python scripts\main.py --project-path C:\project\src --output report.md
+      npx jscpd "C:\project\src" --pattern "**/*.java" --min-tokens 50 --min-lines 5 --reporters json --output .jscpd-report
       ```
 
-  - id: Report
+      如果跳过此步骤，设置 `--skip-jscpd`。
+
+  - id: RunDeadCode
     description: |
-      **📊 Step 3: 阅读报告**
+      **🗑️ Step 3: 运行无用代码扫描**
 
-      脚本会生成两种格式的报告：
+      调用 Python 脚本扫描未使用的 import/字段/方法/局部变量：
 
-      ### Markdown 报告（推荐阅读）
+      ```bash
+      python3 scripts/scan_dead_code.py "{{scan_dir}}" --output .dead-code-results.json
+      ```
 
-      包含：
+      脚本会输出结果到 `.dead-code-results.json`。
+
+      如果跳过此步骤，设置 `--skip-dead-code`。
+
+  - id: GenerateReport
+    description: |
+      **📊 Step 4: 生成报告**
+
+      将 jscpd JSON 报告和无用代码结果合并生成 Markdown 报告：
+
+      ```bash
+      python3 scripts/generate_report.py \
+        --jscpd-report .jscpd-report/jscpd-report.json \
+        --dead-code-report .dead-code-results.json \
+        --output "{{output}}"
+      ```
+
+      报告包含：
       - 📊 概览统计表（重复块数、总行数、问题数、扫描范围等）
-      - 🔴🟡🟢 严重程度分布
+      - 🔴🟡🟢 重复代码严重程度分布
       - 🔄 重复代码 Top 20（含文件路径、行号、重复行数、严重程度）
-      - 🗑️ 无用代码分类（未使用的 import/字段/方法/局部变量）
+      - 🗑️ 无用代码分类列表
       - 💡 重构建议
 
-      示例输出结构：
-      ```markdown
-      # Java 代码质量扫描报告
-
-      **项目**: my-project
-      **扫描时间**: 2026-05-12 14:30 CST
-      **扫描范围**: /path/to/src
-
-      ## 📊 概览统计
-      | 指标 | 数值 |
-      |------|------|
-      | 重复代码块数量 | 12 个 |
-      | 重复代码总行数 | 345 行 |
-      ...
-
-      ## 🔄 重复代码 Top 20
-      ### 1. 🔴 Service.java (行 45-78)
-      - **文件**: `com/example/Service.java`
-      - **重复行数**: 34 行
-      - **严重程度**: 高
-      - **详情**: 该代码块与文件 [AdminService.java] 第 52-85 行存在重复
-      ...
-
-      ## 🗑️ 无用代码
-      ### 类型分布
-      | 类型 | 数量 |
-      |------|------|
-      | 未使用的 import | 23 |
-      | 未使用的 private 字段 | 5 |
-      ...
-
-      ## 💡 重构建议
-      1. **优先处理 3 处高严重度重复代码**：建议提取公共基类或工具类
-      ...
-      ```
-
-      ### Excel 报告（详细明细）
-
-      包含两个 Sheet：
-      - **冗余重复代码**：每条记录包含重要程度（高/中/低）、文件路径、行号、重复位置详情
-      - **无用代码**：每条记录包含重要程度、文件路径、行号、为什么无用
-      - 高/中重要程度行分别用红色/黄色背景突出显示
-      - 按重要程度从高到低排序
+      输出示例见 `examples/` 目录。
 
   - id: Cleanup
     description: |
-      扫描完成后自动清理临时文件。报告文件保留在指定输出路径。
+      **🧹 Step 5: 清理临时文件**
+
+      ```bash
+      rm -rf .jscpd-report .dead-code-results.json
+      ```
