@@ -237,6 +237,50 @@ def scan_project_structure(project_root: Path) -> List[str]:
     return sorted_dirs
 
 
+def parse_indices(input_str: str, max_val: int) -> List[int]:
+    """
+    解析用户输入的编号表达式，支持以下格式：
+    - 单个: "3" → [3]
+    - 逗号: "1,3,5" → [1, 3, 5]
+    - 范围: "3-7" → [3, 4, 5, 6, 7]
+    - 混用: "1,3-5,7" → [1, 3, 4, 5, 7]
+    - 空/全部: "" → [1, 2, ..., max_val]
+
+    返回 1-based 索引列表，结果去重排序，超出 [1, max_val] 的值会被忽略。
+    """
+    if not input_str.strip():
+        return list(range(1, max_val + 1))
+
+    indices: Set[int] = set()
+    parts = [p.strip() for p in input_str.split(",")]
+    for part in parts:
+        if not part:
+            continue
+        if "-" in part:
+            # 范围: "3-7"
+            try:
+                a, b = part.split("-", 1)
+                start, end = int(a.strip()), int(b.strip())
+                start, end = min(start, end), max(start, end)
+                for i in range(start, end + 1):
+                    if 1 <= i <= max_val:
+                        indices.add(i)
+            except (ValueError, IndexError):
+                warn(f"无法解析范围: {part}，已跳过")
+        else:
+            # 单个编号
+            try:
+                i = int(part)
+                if 1 <= i <= max_val:
+                    indices.add(i)
+                else:
+                    warn(f"编号 {i} 超出范围 [1, {max_val}]，已跳过")
+            except ValueError:
+                warn(f"无法解析: {part}，已跳过")
+
+    return sorted(indices)
+
+
 def select_scan_target(project_root: Path) -> List[Path]:
     """
     选择扫描目标路径。
@@ -245,8 +289,11 @@ def select_scan_target(project_root: Path) -> List[Path]:
     行为：
     - 如果项目根目录包含 Java 文件，直接返回 [根目录]
     - 否则列出子模块，提示用户选择：
-      - 输入编号 → 只扫描对应模块
-      - 输入 0 或直接回车（不输入）→ 扫描所有模块（兜底逻辑）
+      - 输入单个编号（如 `3`）→ 只扫描对应模块
+      - 输入逗号分隔（如 `1,3,5`）→ 扫描多个指定模块
+      - 输入范围（如 `2-5`）→ 扫描范围内所有模块
+      - 混用（如 `1,3-5,7`）→ 扫描指定和范围内的所有模块
+      - **直接回车（不输入）→ 扫描所有模块（兜底逻辑）**
     """
     # 检查根目录是否包含 Java 文件
     root_has_java = False
@@ -272,26 +319,18 @@ def select_scan_target(project_root: Path) -> List[Path]:
         warn("项目中未找到任何 Java 文件")
         return [project_root]
 
-    try:
-        choice = input("\n  请输入编号（直接回车=扫描全部模块）: ").strip()
-        if not choice:
-            # 兜底：用户没有输入编号，扫描所有模块
-            info("未输入编号，扫描所有模块")
-            return [project_root / d for d in dirs]
-        idx = int(choice)
-        if idx == 0:
-            info("扫描所有模块")
-            return [project_root / d for d in dirs]
-        if 1 <= idx <= len(dirs):
-            selected = project_root / dirs[idx - 1]
-            info(f"扫描子目录: {dirs[idx - 1]}")
-            return [selected]
-        else:
-            warn(f"无效选择，扫描所有模块")
-            return [project_root / d for d in dirs]
-    except (ValueError, IndexError):
-        warn("输入无效，扫描所有模块")
+    hint = "\n  输入编号（支持: 单个如 3 / 逗号如 1,3,5 / 范围如 2-5 / 直接回车=全部）: "
+    choice = input(hint).strip()
+
+    indices = parse_indices(choice, len(dirs))
+
+    if not indices:
+        warn("未匹配到有效编号，扫描所有模块")
         return [project_root / d for d in dirs]
+
+    selected_dirs = [project_root / dirs[i - 1] for i in indices]
+    info(f"将扫描 {len(selected_dirs)} 个模块: {[dirs[i-1] for i in indices]}")
+    return selected_dirs
 
 
 # ====================================================================
