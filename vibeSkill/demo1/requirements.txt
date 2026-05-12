@@ -1,0 +1,7 @@
+# demo1 - Java Code Quality Scanner
+# 重复代码 + 无用代码扫描
+
+# 无用代码扫描依赖（AST 解析）
+javalang>=0.13.0
+
+# 报告生成仅使用 Python 标准库，无需额外依赖
