@@ -367,10 +367,33 @@ def select_scan_target(project_root: Path) -> List[Path]:
 # 模块 1: 冗余代码扫描 (jscpd)
 # ====================================================================
 
+def _get_start_line(file_info: Dict[str, Any]) -> int:
+    """从 jscpd 的 firstFile/secondFile 中提取起始行号。
+    兼容 jscpd 3.x (字段在顶层为整数) 和 4.x (字段在 startLoc.line)。"""
+    val = file_info.get("start", 0)
+    if isinstance(val, int) and val > 0:
+        return val
+    if isinstance(val, dict):
+        return val.get("line", 0)
+    return file_info.get("startLoc", {}).get("line", 0)
+
+
+def _get_end_line(file_info: Dict[str, Any]) -> int:
+    """从 jscpd 的 firstFile/secondFile 中提取结束行号。"""
+    val = file_info.get("end", 0)
+    if isinstance(val, int) and val > 0:
+        return val
+    if isinstance(val, dict):
+        return val.get("line", 0)
+    return file_info.get("endLoc", {}).get("line", 0)
+
+
 def scan_duplicate(scan_targets: List[Path], temp_dir: str, project_root: Path) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """
     执行 jscpd 扫描并解析 JSON 报告。
     支持同时对多个目录扫描，实现跨模块重复代码检测。
+
+    当目标准备过多时（>3 个），使用 .jscpd.json 配置文件避免命令行超长。
 
     Args:
         scan_targets: 要扫描的目标目录列表（可能是多个子模块）。
@@ -407,12 +430,38 @@ def scan_duplicate(scan_targets: List[Path], temp_dir: str, project_root: Path) 
 
     info(f"共 {len(valid_targets)} 个目录，包含 {total_java} 个 Java 文件")
 
-    try:
-        jscpd_path = shutil.which("jscpd")
-        # jscpd 支持传入多个目录路径，一次性扫描
+    jscpd_bin = shutil.which("jscpd")
+    if jscpd_bin:
+        jscpd_cmd = [jscpd_bin]
+    else:
+        jscpd_cmd = ["npx", "jscpd"]
+
+    # 目标太多时用配置文件，避免命令行参数超长
+    if len(valid_targets) > 3:
+        info(f"扫描目标较多 ({len(valid_targets)} 个)，使用配置文件传递路径")
+        config = {
+            "path": [str(t) for t in valid_targets],
+            "pattern": "**/*.java",
+            "reporters": ["json"],
+            "output": temp_dir,
+            "threshold": 0,
+            "minLines": 3,
+            "minTokens": 10,
+        }
+        config_path = os.path.join(temp_dir, ".jscpd.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+        cmd = jscpd_cmd + ["--config", config_path]
+
+        try:
+            result = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            err_msg = "jscpd 扫描超时（超过 600 秒）"
+            err(err_msg)
+            return results, err_msg
+    else:
         target_args = [str(t) for t in valid_targets]
-        base_cmd = [jscpd_path] if jscpd_path else ["npx", "jscpd"]
-        cmd = base_cmd + target_args + [
+        cmd = jscpd_cmd + target_args + [
             "--pattern", "**/*.java",
             "--reporters", "json",
             "--output", temp_dir,
@@ -420,122 +469,116 @@ def scan_duplicate(scan_targets: List[Path], temp_dir: str, project_root: Path) 
             "--min-lines", "3",
             "--min-tokens", "10",
         ]
-        result = run_cmd(cmd, cwd=str(project_root), timeout=600)
 
-        # 检查 jscpd 输出是否有错误提示
-        stderr_text = result.stderr.strip() if result.stderr else ""
-        if result.returncode != 0:
-            if "No files found" in stderr_text or "no files" in stderr_text.lower():
-                err_msg = f"jscpd 未找到匹配的 Java 文件（退出码 {result.returncode}）: {stderr_text[:300]}"
-                err(err_msg)
-                return results, err_msg
-            else:
-                err_msg = f"jscpd 执行异常（退出码 {result.returncode}）: {stderr_text[:300]}"
-                err(err_msg)
-                return results, err_msg
+        try:
+            result = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            err_msg = "jscpd 扫描超时（超过 600 秒）"
+            err(err_msg)
+            return results, err_msg
 
-        # 查找生成的 JSON 报告
-        report_path: Optional[str] = None
+    stderr_text = result.stderr.strip() if result.stderr else ""
+    stdout_text = result.stdout.strip() if result.stdout else ""
+
+    # jscpd 发现重复且超过 threshold=0% 时可能会非零退出，
+    # 但只要生成了报告就继续解析，不完全依赖 exit code
+    if result.returncode != 0:
+        if "Too many duplicates" in stderr_text or "over threshold" in stderr_text:
+            warn("jscpd 检测到重复超过阈值，但仍会生成报告，继续解析...")
+        elif "No files found" in stderr_text or "no files" in stderr_text.lower():
+            err_msg = f"jscpd 未找到匹配的 Java 文件（退出码 {result.returncode}）: {stderr_text[:300]}"
+            err(err_msg)
+            return results, err_msg
+        else:
+            # 非致命错误，先尝试找报告
+            warn(f"jscpd 异常退出（退出码 {result.returncode}）：检查是否生成了报告")
+
+    # 查找生成的 JSON 报告
+    report_path: Optional[str] = None
+    for root, _, files in os.walk(temp_dir):
+        for f in files:
+            if f.endswith(".json") and "jscpd" in f.lower():
+                report_path = os.path.join(root, f)
+                break
+        if report_path:
+            break
+
+    if not report_path:
         for root, _, files in os.walk(temp_dir):
             for f in files:
-                if f.endswith(".json") and "jscpd" in f.lower():
+                if f.endswith(".json") and not f.startswith("."):
                     report_path = os.path.join(root, f)
                     break
             if report_path:
                 break
 
-        if not report_path:
-            for root, _, files in os.walk(temp_dir):
-                for f in files:
-                    if f.endswith(".json"):
-                        report_path = os.path.join(root, f)
-                        break
-                if report_path:
-                    break
-
-        if not report_path:
-            info("jscpd 未生成报告，未发现重复代码。")
-            return results, None
-
-        info(f"解析报告: {report_path}")
-        with open(report_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        duplicates = data.get("duplicates", [])
-        info(f"发现 {len(duplicates)} 处重复")
-
-        for dup in duplicates:
-            try:
-                first = dup.get("firstFile", {})
-                second = dup.get("secondFile", {})
-
-                f_file = first.get("name", "") or first.get("path", "")
-                if not f_file:
-                    continue
-                # jscpd 输出的行号直接是整数（start/end 字段），
-                # 部分版本嵌套在 startLoc.line / endLoc.line 中
-                f_start = first.get("start", 0)
-                f_end = first.get("end", 0)
-                if not isinstance(f_start, int):
-                    f_start = first.get("startLoc", {}).get("line", 0)
-                if not isinstance(f_end, int):
-                    f_end = first.get("endLoc", {}).get("line", 0)
-
-                s_file = second.get("name", "") or second.get("path", "")
-                if not s_file:
-                    continue
-                s_start = second.get("start", 0)
-                s_end = second.get("end", 0)
-                if not isinstance(s_start, int):
-                    s_start = second.get("startLoc", {}).get("line", 0)
-                if not isinstance(s_end, int):
-                    s_end = second.get("endLoc", {}).get("line", 0)
-
-                s_filename = os.path.basename(s_file)
-                desc = (
-                    f"该代码块与文件 [{s_filename}] 第 {s_start}-{s_end} 行存在重复"
-                    f" (文件: {rel_path(project_root, s_file)})"
-                )
-
-                dup_lines = f_end - f_start + 1
-                # 优先级：跨文件重复 + 行数多的函数级重复 = 高
-                # 非跨文件但行数多 = 中
-                # 行数少的小重复 = 低
-                is_cross_file = os.path.basename(f_file) != os.path.basename(s_file)
-                if dup_lines >= 10 and is_cross_file:
-                    priority = PRIORITY_HIGH
-                elif dup_lines >= 6:
-                    priority = PRIORITY_MEDIUM
-                else:
-                    priority = PRIORITY_LOW
-
-                results.append({
-                    "priority": priority,
-                    "relative_path": rel_path(project_root, f_file),
-                    "filename": os.path.basename(f_file),
-                    "start_line": f_start,
-                    "end_line": f_end,
-                    "issue_type": "冗余重复代码",
-                    "description": desc,
-                })
-            except Exception as e:
-                warn(f"解析 duplicate 记录时异常: {e}")
-                continue
-
+    if not report_path:
+        info("jscpd 未生成报告，未发现重复代码。")
         return results, None
 
-    except subprocess.TimeoutExpired:
-        err_msg = "jscpd 扫描超时（超过 600 秒）"
-        err(err_msg)
-        return results, err_msg
-    except FileNotFoundError:
-        err_msg = "jscpd 命令未找到，请确认已安装: npm install -g jscpd"
-        err(err_msg)
-        return results, err_msg
-    except Exception as e:
-        err_msg = f"jscpd 扫描异常: {e}"
-        err(err_msg)
-        return results, err_msg
+    info(f"解析报告: {report_path}")
+    with open(report_path, "r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError as je:
+            err_msg = f"jscpd 报告 JSON 解析失败: {je}"
+            err(err_msg)
+            return results, err_msg
+
+    duplicates = data.get("duplicates", [])
+    if not duplicates:
+        info("jscpd 报告中未发现重复代码")
+        return results, None
+
+    info(f"发现 {len(duplicates)} 处重复")
+
+    for dup in duplicates:
+        try:
+            first = dup.get("firstFile", {})
+            second = dup.get("secondFile", {})
+
+            f_file = first.get("name", "") or first.get("path", "")
+            if not f_file:
+                continue
+
+            f_start = _get_start_line(first)
+            f_end = _get_end_line(first)
+            s_start = _get_start_line(second)
+            s_end = _get_end_line(second)
+
+            s_file = second.get("name", "") or second.get("path", "")
+            if not s_file:
+                continue
+
+            s_filename = os.path.basename(s_file)
+            desc = (
+                f"该代码块与文件 [{s_filename}] 第 {s_start}-{s_end} 行存在重复"
+                f" (文件: {rel_path(project_root, s_file)})"
+            )
+
+            dup_lines = f_end - f_start + 1
+            is_cross_file = os.path.basename(f_file) != os.path.basename(s_file)
+            if dup_lines >= 10 and is_cross_file:
+                priority = PRIORITY_HIGH
+            elif dup_lines >= 6:
+                priority = PRIORITY_MEDIUM
+            else:
+                priority = PRIORITY_LOW
+
+            results.append({
+                "priority": priority,
+                "relative_path": rel_path(project_root, f_file),
+                "filename": os.path.basename(f_file),
+                "start_line": f_start,
+                "end_line": f_end,
+                "issue_type": "冗余重复代码",
+                "description": desc,
+            })
+        except Exception as e:
+            warn(f"解析 duplicate 记录时异常: {e}")
+            continue
+
+    return results, None
 
 
 # ====================================================================
