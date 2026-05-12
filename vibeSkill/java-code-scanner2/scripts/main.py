@@ -237,48 +237,69 @@ def scan_project_structure(project_root: Path) -> List[str]:
     return sorted_dirs
 
 
-def parse_indices(input_str: str, max_val: int) -> List[int]:
+def resolve_paths_from_input(project_root: Path, input_str: str) -> List[Path]:
     """
-    解析用户输入的编号表达式，支持以下格式：
-    - 单个: "3" → [3]
-    - 逗号: "1,3,5" → [1, 3, 5]
-    - 范围: "3-7" → [3, 4, 5, 6, 7]
-    - 混用: "1,3-5,7" → [1, 3, 4, 5, 7]
-    - 空/全部: "" → [1, 2, ..., max_val]
+    解析用户输入的路径表达式，返回对应的绝对路径列表。
 
-    返回 1-based 索引列表，结果去重排序，超出 [1, max_val] 的值会被忽略。
+    支持：
+    - 绝对路径：`/home/user/project/module-a`
+    - 相对路径（相对于 project_root）：`module-a`、`src/main`
+    - 逗号分隔多个路径：`module-a,module-b`
+    - 空格分隔多个路径：`module-a module-b`（自动按空格/逗号分割）
+    - 空输入：扫描全部模块（兜底）
+
+    自动过滤掉不存在或不包含 Java 文件的目录，并给出警告。
     """
-    if not input_str.strip():
-        return list(range(1, max_val + 1))
+    raw = input_str.strip()
 
-    indices: Set[int] = set()
-    parts = [p.strip() for p in input_str.split(",")]
+    # 空输入 → 全部模块
+    if not raw:
+        return []
+
+    # 分割：逗号和连续空格都作为分隔符
+    parts = [p.strip() for p in re.split(r"[,\s]+|，", raw) if p.strip()]
+
+    resolved: List[Path] = []
     for part in parts:
-        if not part:
-            continue
-        if "-" in part:
-            # 范围: "3-7"
-            try:
-                a, b = part.split("-", 1)
-                start, end = int(a.strip()), int(b.strip())
-                start, end = min(start, end), max(start, end)
-                for i in range(start, end + 1):
-                    if 1 <= i <= max_val:
-                        indices.add(i)
-            except (ValueError, IndexError):
-                warn(f"无法解析范围: {part}，已跳过")
+        # 尝试作为绝对路径
+        p = Path(part)
+        if p.is_absolute():
+            candidate = p.resolve()
         else:
-            # 单个编号
-            try:
-                i = int(part)
-                if 1 <= i <= max_val:
-                    indices.add(i)
-                else:
-                    warn(f"编号 {i} 超出范围 [1, {max_val}]，已跳过")
-            except ValueError:
-                warn(f"无法解析: {part}，已跳过")
+            # 尝试作为相对路径（相对于 project_root）
+            candidate = (project_root / part).resolve()
 
-    return sorted(indices)
+        if not candidate.exists():
+            warn(f"路径不存在，已跳过: {part}")
+            continue
+        if not candidate.is_dir():
+            warn(f"路径不是目录，已跳过: {part}")
+            continue
+
+        # 检查是否有 Java 文件
+        has_java = any(f.endswith(".java") for f in os.listdir(str(candidate)))
+        if not has_java:
+            has_java = any(
+                f.endswith(".java")
+                for root, _, files in os.walk(str(candidate))
+                for f in files
+            )
+        if not has_java:
+            warn(f"路径中未找到 Java 文件，已跳过: {part}")
+            continue
+
+        resolved.append(candidate)
+
+    # 去重（按绝对路径）
+    seen: Set[str] = set()
+    unique: List[Path] = []
+    for p in resolved:
+        s = str(p)
+        if s not in seen:
+            seen.add(s)
+            unique.append(p)
+
+    return unique
 
 
 def select_scan_target(project_root: Path) -> List[Path]:
@@ -288,11 +309,9 @@ def select_scan_target(project_root: Path) -> List[Path]:
 
     行为：
     - 如果项目根目录包含 Java 文件，直接返回 [根目录]
-    - 否则列出子模块，提示用户选择：
-      - 输入单个编号（如 `3`）→ 只扫描对应模块
-      - 输入逗号分隔（如 `1,3,5`）→ 扫描多个指定模块
-      - 输入范围（如 `2-5`）→ 扫描范围内所有模块
-      - 混用（如 `1,3-5,7`）→ 扫描指定和范围内的所有模块
+    - 否则列出子模块目录，提示输入路径：
+      - 用户/智能体可以输入模块的绝对路径或相对路径
+      - 支持逗号或空格分隔多个路径
       - **直接回车（不输入）→ 扫描所有模块（兜底逻辑）**
     """
     # 检查根目录是否包含 Java 文件
@@ -312,25 +331,29 @@ def select_scan_target(project_root: Path) -> List[Path]:
         info("项目根目录包含 Java 文件，直接扫描根目录")
         return [project_root]
 
-    # 列出子模块让用户选择
+    # 列出子模块让用户/智能体选择
     dirs = scan_project_structure(project_root)
 
     if not dirs:
         warn("项目中未找到任何 Java 文件")
         return [project_root]
 
-    hint = "\n  输入编号（支持: 单个如 3 / 逗号如 1,3,5 / 范围如 2-5 / 直接回车=全部）: "
+    hint = (
+        "\n  请输入要扫描的目录路径（支持: 绝对路径 / 相对路径 / 逗号或空格分隔多个 / 直接回车=全部）:\n"
+        "  > "
+    )
     choice = input(hint).strip()
 
-    indices = parse_indices(choice, len(dirs))
+    selected = resolve_paths_from_input(project_root, choice)
 
-    if not indices:
-        warn("未匹配到有效编号，扫描所有模块")
+    if not selected:
+        # 没有有效输入或路径全部无效 → 扫描所有
+        info("未指定有效路径，扫描所有模块")
         return [project_root / d for d in dirs]
 
-    selected_dirs = [project_root / dirs[i - 1] for i in indices]
-    info(f"将扫描 {len(selected_dirs)} 个模块: {[dirs[i-1] for i in indices]}")
-    return selected_dirs
+    names = [str(p.relative_to(project_root)) if project_root in p.parents else str(p) for p in selected]
+    info(f"将扫描 {len(selected)} 个目录: {names}")
+    return selected
 
 
 # ====================================================================
