@@ -360,12 +360,13 @@ def select_scan_target(project_root: Path) -> List[Path]:
 # 模块 1: 冗余代码扫描 (jscpd)
 # ====================================================================
 
-def scan_duplicate(scan_target: Path, temp_dir: str, project_root: Path) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def scan_duplicate(scan_targets: List[Path], temp_dir: str, project_root: Path) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """
     执行 jscpd 扫描并解析 JSON 报告。
+    支持同时对多个目录扫描，实现跨模块重复代码检测。
 
     Args:
-        scan_target: 要扫描的目标目录（可能是子模块）。
+        scan_targets: 要扫描的目标目录列表（可能是多个子模块）。
         temp_dir: 临时目录，用于存放 jscpd 输出。
         project_root: 项目根目录，用于计算相对路径。
 
@@ -379,44 +380,40 @@ def scan_duplicate(scan_target: Path, temp_dir: str, project_root: Path) -> Tupl
     results: List[Dict[str, Any]] = []
     error_msg: Optional[str] = None
 
-    # 先检查目标目录是否有 Java 文件
-    java_count = 0
-    for root, _, files in os.walk(str(scan_target)):
-        java_count += sum(1 for f in files if f.endswith(".java"))
+    # 统计所有扫描目标的 Java 文件数
+    total_java = 0
+    valid_targets = []
+    for t in scan_targets:
+        java_count = 0
+        for root, _, files in os.walk(str(t)):
+            java_count += sum(1 for f in files if f.endswith(".java"))
+        if java_count > 0:
+            total_java += java_count
+            valid_targets.append(t)
+        else:
+            warn(f"目标目录中没有 Java 文件，已跳过: {t}")
 
-    if java_count == 0:
-        err_msg = f"目标目录中没有找到任何 Java 文件: {scan_target}"
+    if not valid_targets:
+        err_msg = f"所有目标目录中都没有找到任何 Java 文件"
         err(err_msg)
         return results, err_msg
 
-    info(f"目标目录包含 {java_count} 个 Java 文件")
+    info(f"共 {len(valid_targets)} 个目录，包含 {total_java} 个 Java 文件")
 
     try:
-        # Windows 下 npx 可能找不到 PATH，先尝试直接使用 jscpd
         jscpd_path = shutil.which("jscpd")
-        if jscpd_path:
-            cmd = [
-                jscpd_path,
-                str(scan_target),
-                "--pattern", "**/*.java",
-                "--reporters", "json",
-                "--output", temp_dir,
-                "--threshold", "0",
-                "--min-lines", "6",
-                "--min-tokens", "50",
-            ]
-        else:
-            cmd = [
-                "npx", "jscpd",
-                str(scan_target),
-                "--pattern", "**/*.java",
-                "--reporters", "json",
-                "--output", temp_dir,
-                "--threshold", "0",
-                "--min-lines", "6",
-                "--min-tokens", "50",
-            ]
-        result = run_cmd(cmd, cwd=str(scan_target), timeout=600)
+        # jscpd 支持传入多个目录路径，一次性扫描
+        target_args = [str(t) for t in valid_targets]
+        base_cmd = [jscpd_path] if jscpd_path else ["npx", "jscpd"]
+        cmd = base_cmd + target_args + [
+            "--pattern", "**/*.java",
+            "--reporters", "json",
+            "--output", temp_dir,
+            "--threshold", "0",
+            "--min-lines", "6",
+            "--min-tokens", "50",
+        ]
+        result = run_cmd(cmd, cwd=str(project_root), timeout=600)
 
         # 检查 jscpd 输出是否有错误提示
         stderr_text = result.stderr.strip() if result.stderr else ""
@@ -1070,34 +1067,27 @@ Linux/macOS:
     skip_jscpd2 = os.environ.get("SKIP_JSCPD2", "").lower() in ("1", "true", "yes")
 
     try:
-        # 5. 对每个目标模块执行扫描
+        # 5a. 冗余代码扫描（一次性扫所有目标模块，支持跨模块重复检测）
+        if skip_jscpd or skip_jscpd2:
+            skip("SKIP_JSCPD 已设置，跳过")
+        elif not env.get("jscpd", False):
+            skip("jscpd 未安装，跳过")
+        else:
+            dup_results, dup_err = scan_duplicate(scan_targets, tmpdir.name, project_root)
+            if dup_err:
+                scan_errors.append(f"[冗余代码] {dup_err}")
+
+        # 5b. 无用代码扫描（每个模块单独扫描，AST 分析不跨模块）
         for i, scan_root in enumerate(scan_targets, 1):
             module_label = f"模块 {i}/{len(scan_targets)}"
-            print(f"\n{'=' * 60}")
-            info(f"{module_label}: {scan_root}")
-            print(f"{'=' * 60}")
-
-            # 5a. 冗余代码扫描
-            if skip_jscpd or skip_jscpd2:
-                skip("SKIP_JSCPD 已设置，跳过")
-            elif not env.get("jscpd", False):
-                skip("jscpd 未安装，跳过")
-            else:
-                dup_batch, dup_err = scan_duplicate(scan_root, tmpdir.name, project_root)
-                dup_results.extend(dup_batch)
-                if dup_err:
-                    scan_errors.append(f"[{module_label} 冗余代码] {dup_err}")
-
-            # 5b. 无用代码扫描
             if not env.get("javalang", False):
                 skip("javalang 未安装，跳过")
-            else:
-                dead_batch, dead_err = scan_dead_code(scan_root, project_root)
-                dead_results.extend(dead_batch)
-                if dead_err:
-                    scan_errors.append(f"[{module_label} 无用代码] {dead_err}")
-
-            info(f"{module_label} 扫描完成")
+                break
+            dead_batch, dead_err = scan_dead_code(scan_root, project_root)
+            dead_results.extend(dead_batch)
+            if dead_err:
+                scan_errors.append(f"[{module_label} 无用代码] {dead_err}")
+            info(f"{module_label} 无用代码扫描完成")
 
         # 6. 生成 Excel（如果有异常信息也记录）
         if scan_errors:
