@@ -4,4 +4,7 @@
 # 无用代码扫描依赖（AST 解析）
 javalang>=0.13.0
 
-# 报告生成仅使用 Python 标准库，无需额外依赖
+# Excel 报告生成依赖
+openpyxl>=3.0.0
+
+# Markdown 报告生成使用 Python 标准库，无需额外依赖
